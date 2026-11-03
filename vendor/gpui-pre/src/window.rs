@@ -4449,6 +4449,30 @@ impl Window {
         result
     }
 
+    /// HERDR: like [`Self::paint_layer`], and layers painted inside (text
+    /// lines) share its draw order instead of each taking its own: for a grid
+    /// of cells whose backgrounds, glyphs and underlines never overlap out of
+    /// kind order (quads, then paths, underlines, then glyphs).
+    pub fn paint_flat_layer<R>(&mut self, bounds: Bounds<Pixels>, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let content_mask = self.content_mask();
+        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        if !clipped_bounds.is_empty() {
+            self.next_frame
+                .scene
+                .push_flat_layer(self.cover_bounds(clipped_bounds));
+        }
+
+        let result = f(self);
+
+        if !clipped_bounds.is_empty() {
+            self.next_frame.scene.pop_layer();
+        }
+
+        result
+    }
+
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill.

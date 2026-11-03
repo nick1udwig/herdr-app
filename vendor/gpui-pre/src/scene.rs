@@ -41,7 +41,8 @@ impl From<bool> for PaddedBool32 {
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
     primitive_bounds: BoundsTree<ScaledPixels>,
-    layer_stack: Vec<DrawOrder>,
+    /// Each open layer's draw order, and whether layers inside it share it.
+    layer_stack: Vec<(DrawOrder, bool)>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -73,10 +74,27 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        let order = self.primitive_bounds.insert(bounds);
-        self.layer_stack.push(order);
+        let (order, flat) = self.layer_order(bounds);
+        self.layer_stack.push((order, flat));
         self.paint_operations
             .push(PaintOperation::StartLayer(bounds));
+    }
+
+    /// HERDR: a layer whose nested layers (a text line each) share its draw
+    /// order instead of each being placed in the bounds tree: for a grid of
+    /// cells (a terminal), where nothing inside overlaps out of kind order.
+    pub fn push_flat_layer(&mut self, bounds: Bounds<ScaledPixels>) {
+        let (order, _) = self.layer_order(bounds);
+        self.layer_stack.push((order, true));
+        self.paint_operations
+            .push(PaintOperation::StartFlatLayer(bounds));
+    }
+
+    fn layer_order(&mut self, bounds: Bounds<ScaledPixels>) -> (DrawOrder, bool) {
+        match self.layer_stack.last() {
+            Some(&(order, true)) => (order, true),
+            _ => (self.primitive_bounds.insert(bounds), false),
+        }
     }
 
     pub fn pop_layer(&mut self) {
@@ -97,7 +115,7 @@ impl Scene {
         let order = self
             .layer_stack
             .last()
-            .copied()
+            .map(|&(order, _)| order)
             .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds));
         match &mut primitive {
             Primitive::Shadow(shadow) => {
@@ -143,6 +161,7 @@ impl Scene {
             match operation {
                 PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                PaintOperation::StartFlatLayer(bounds) => self.push_flat_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
@@ -214,6 +233,7 @@ pub(crate) enum PrimitiveKind {
 pub(crate) enum PaintOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
+    StartFlatLayer(Bounds<ScaledPixels>),
     EndLayer,
 }
 

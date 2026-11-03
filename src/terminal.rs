@@ -1606,49 +1606,61 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         painted.entry(key).or_insert(cached);
     }
 
-    // Paint all program backgrounds first, then search overlays, then text.
-    // This lets a match highlight sit below glyphs without contaminating
-    // cached RowOps or the terminal's own selection/copy state.
-    for (y, row) in frame.rows.iter().enumerate() {
-        let ops = &painted[&Rc::as_ptr(row)].1;
-        for op in ops {
-            match op {
-                RowOp::Bg { from, to, color } => {
-                    let b = Bounds::new(at(*from, y), size(cell.width * (to - from) as f32, cell.height));
-                    window.paint_quad(fill(snap_box(b), *color));
+    window.paint_flat_layer(bounds, |window| {
+        // Paint all program backgrounds first, then search overlays, then text.
+        // This lets a match highlight sit below glyphs without contaminating
+        // cached RowOps or the terminal's own selection/copy state.
+        for (y, row) in frame.rows.iter().enumerate() {
+            let ops = &painted[&Rc::as_ptr(row)].1;
+            for op in ops {
+                match op {
+                    RowOp::Bg { from, to, color } => {
+                        let b = Bounds::new(at(*from, y), size(cell.width * (to - from) as f32, cell.height));
+                        window.paint_quad(fill(snap_box(b), *color));
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
-    }
-    for selected in [false, true] {
-        for span in frame.search_spans.iter().filter(|span| span.selected == selected) {
-            let y = span.row as usize;
-            let Some(row) = frame.rows.get(y) else { continue };
-            let start = span.start as usize;
-            let end = (span.end as usize + 1).min(row.len());
-            if start >= end {
-                continue;
-            }
-            let opacity = if selected { 0.55 } else { 0.28 };
-            let highlight = crate::settings::color("accent").opacity(opacity);
-            let b = Bounds::new(at(start, y), size(cell.width * (end - start) as f32, cell.height));
-            window.paint_quad(fill(snap_box(b), highlight));
-        }
-    }
-    for (y, row) in frame.rows.iter().enumerate() {
-        let ops = &painted[&Rc::as_ptr(row)].1;
-        for op in ops {
-            match op {
-                RowOp::Bg { .. } => {}
-                RowOp::Sprite { x, text, color } => crate::sprites::paint(text, Bounds::new(at(*x, y), cell), *color, window),
-                RowOp::Icon { x, offset, font, glyph, size, color } => {
-                    let _ = window.paint_glyph(at(*x, y) + *offset, *font, *glyph, *size, *color);
+        for selected in [false, true] {
+            for span in frame.search_spans.iter().filter(|span| span.selected == selected) {
+                let y = span.row as usize;
+                let Some(row) = frame.rows.get(y) else { continue };
+                let start = span.start as usize;
+                let end = (span.end as usize + 1).min(row.len());
+                if start >= end {
+                    continue;
                 }
-                RowOp::Text { x, line } => {
+                let opacity = if selected { 0.55 } else { 0.28 };
+                let highlight = crate::settings::color("accent").opacity(opacity);
+                let b = Bounds::new(at(start, y), size(cell.width * (end - start) as f32, cell.height));
+                window.paint_quad(fill(snap_box(b), highlight));
+            }
+        }
+    });
+
+    // Consecutive text runs share a draw order to skip the bounds tree.
+    // Sprites and icons can extend into adjacent cells, so paint them separately.
+    let mut foreground = frame.rows.iter().enumerate()
+        .flat_map(|(y, row)| painted[&Rc::as_ptr(row)].1.iter().map(move |op| (y, op)))
+        .filter(|(_, op)| !matches!(op, RowOp::Bg { .. }))
+        .peekable();
+    while let Some(&(y, op)) = foreground.peek() {
+        match op {
+            RowOp::Text { .. } => window.paint_flat_layer(bounds, |window| {
+                while let Some((y, RowOp::Text { x, line })) = foreground.next_if(|(_, op)| matches!(op, RowOp::Text { .. })) {
                     let _ = line.paint(at(*x, y), cell.height, TextAlign::Left, None, window, cx);
                 }
+            }),
+            RowOp::Sprite { x, text, color } => {
+                foreground.next();
+                crate::sprites::paint(text, Bounds::new(at(*x, y), cell), *color, window);
             }
+            RowOp::Icon { x, offset, font, glyph, size, color } => {
+                foreground.next();
+                let _ = window.paint_glyph(at(*x, y) + *offset, *font, *glyph, *size, *color);
+            }
+            RowOp::Bg { .. } => unreachable!(),
         }
     }
     {
@@ -2722,6 +2734,50 @@ mod tests {
             }
         }
         crate::settings::set((*original).clone());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn overlapping_terminal_sprites_keep_cell_draw_order() {
+        use super::*;
+
+        struct Sprites { grid: Rc<RefCell<Grid>> }
+        impl Render for Sprites {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let grid = self.grid.clone();
+                canvas(|_, _, _| {}, move |bounds, _, window, cx| {
+                    paint_grid(bounds, &grid, false, window, cx);
+                }).size_full()
+            }
+        }
+
+        let mut cx = HeadlessAppContext::with_platform(
+            gpui_platform::current_platform(true).text_system(),
+            Arc::new(()),
+            gpui_platform::current_headless_renderer,
+        );
+        for cell in [size(px(9.), px(18.)), size(px(9.5), px(19.5))] {
+            let (pad_x, pad_y) = pad();
+            let bounds = size(cell.width * 4. + px(pad_x * 2.), cell.height * 2. + px(pad_y * 2.));
+            let handle = cx.open_window(bounds, |_, cx| {
+                let terminal = cx.new(|cx| TerminalView::attach(crate::hc::offline(), "sprites".into(), (4, 2), cx));
+                let grid = terminal.read(cx).grid.clone();
+                grid.borrow_mut().cell = cell;
+                grid.borrow_mut().vt.write("\x1b[?25l\x1b[38;2;255;0;0m\u{e0b2}\x1b[38;2;0;255;0m█\r\n█\x1b[38;2;255;0;0m\u{e0b0}".as_bytes());
+                cx.new(|_| Sprites { grid })
+            }).unwrap();
+            cx.update_window(handle.into(), |root, window, cx| {
+                let _ = window.draw(cx);
+                let image = window.render_to_image().unwrap();
+                let root = root.downcast::<Sprites>().unwrap();
+                let origin = root.read(cx).grid.borrow().origin;
+                let scale = window.scale_factor();
+                let edge = (f32::from(origin.x + cell.width) * scale).round() as u32;
+                let y = |row: f32| ((f32::from(origin.y) + f32::from(cell.height) * (row + 0.5)) * scale).round() as u32;
+                assert_eq!(image.get_pixel(edge, y(0.)).0, [0, 255, 0, 255], "later block must cover the Powerline extension");
+                assert_eq!(image.get_pixel(edge - 1, y(1.)).0, [255, 0, 0, 255], "later Powerline must cover the block edge");
+            }).unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]
