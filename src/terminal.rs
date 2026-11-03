@@ -109,7 +109,7 @@ pub struct TerminalView {
     focus: FocusHandle,
     was_focused: bool,
     /// The window frame this terminal was last put on screen in (`FRAME`).
-    shown_in: Cell<u64>,
+    shown_in: Rc<Cell<u64>>,
     /// When the person last typed here: output right after is shown at once.
     typed_at: Cell<Option<Instant>>,
     /// Scrolled this gesture, in lines, toward the next whole one.
@@ -255,7 +255,7 @@ impl TerminalView {
             })),
             focus: cx.focus_handle(),
             was_focused: false,
-            shown_in: Cell::new(0),
+            shown_in: Rc::new(Cell::new(0)),
             typed_at: Cell::new(None),
             scrolled: point(0.0, 0.0),
             search_open: false,
@@ -305,6 +305,7 @@ impl TerminalView {
             (cols, rows, facts)
         };
         let address = self.address.clone();
+        let shown_in = self.shown_in.clone();
         // Replacing the task drops an attach still in flight for an older connection.
         self._reader = Some(cx.spawn(async move |this, cx| {
             let attached = cx.background_executor().spawn(async move { core.attach(&address, cols, rows, facts) }).await;
@@ -312,9 +313,12 @@ impl TerminalView {
                 return;
             };
             while let Ok(first) = rx.recv().await {
+                if shown_in.get() != FRAME.load(Ordering::Relaxed) && matches!(&first, Stream::Data(_)) {
+                    cx.background_executor().timer(Duration::from_millis(16)).await;
+                }
                 let mut batch = vec![first];
                 while let Ok(more) = rx.try_recv() {
-                    batch.push(more);
+                    append_output(&mut batch, more);
                 }
                 let alive = this.update(cx, |this, cx| this.ingest(batch, cx));
                 if !matches!(alive, Ok(true)) {
@@ -1809,6 +1813,13 @@ impl EntityInputHandler for TerminalView {
     }
 }
 
+fn append_output(batch: &mut Vec<Stream>, item: Stream) {
+    match (batch.last_mut(), item) {
+        (Some(Stream::Data(pending)), Stream::Data(bytes)) if pending.len() + bytes.len() <= 64 * 1024 => pending.extend(bytes),
+        (_, item) => batch.push(item),
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         crate::bench::count(&crate::bench::TERMINAL);
@@ -2115,6 +2126,25 @@ impl Focusable for TerminalView {
 mod tests {
     use super::{ScrollTarget, pages_to_lines, scroll_target};
     use serde_json::{Value, json};
+
+    #[test]
+    fn output_batches_preserve_split_sequences_and_close_order() {
+        use crate::hc::Stream;
+        let mut batch = Vec::new();
+        for bytes in [b"\x1b[3".as_slice(), b"1mred", b"\x1b[0m"] {
+            super::append_output(&mut batch, Stream::Data(bytes.to_vec()));
+        }
+        assert_eq!(batch.len(), 1);
+        let Stream::Data(bytes) = &batch[0] else { panic!("output missing") };
+        assert_eq!(bytes, b"\x1b[31mred\x1b[0m");
+        super::append_output(&mut batch, Stream::Closed(serde_json::json!({"reason":"exited"})));
+        super::append_output(&mut batch, Stream::Data(vec![b'x'; 64 * 1024]));
+        super::append_output(&mut batch, Stream::Data(vec![b'y']));
+        assert_eq!(batch.len(), 4);
+        assert!(matches!(&batch[1], Stream::Closed(_)));
+        assert!(matches!(&batch[2], Stream::Data(bytes) if bytes.len() == 64 * 1024));
+        assert!(matches!(&batch[3], Stream::Data(bytes) if bytes == b"y"));
+    }
 
     #[gpui::test]
     fn terminal_release_ends_window_text_selection(cx: &mut gpui::TestAppContext) {
