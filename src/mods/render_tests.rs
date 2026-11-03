@@ -463,6 +463,18 @@ fn option_key_settings_are_only_shown_on_macos(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn look_settings_offer_turning_spinners_off(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    for setup in [None, Some("this.person = { spinners: false };")] {
+        let mut p = props();
+        p["section"] = json!("look");
+        let tree = describe(cx, &staged, "frame/settings", true, p, updates("current", "current"), setup).unwrap();
+        assert!(tree.contains("st-spinners") && tree.contains("Spinners"), "{tree}");
+    }
+}
+
+#[gpui::test]
 fn settings_sections_and_updates(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let start = Instant::now();

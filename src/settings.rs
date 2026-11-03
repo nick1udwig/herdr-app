@@ -389,6 +389,9 @@ pub struct Person {
     /// Allow terminal programs (including remote ones) to copy text locally.
     #[serde(skip_serializing_if = "is_true")]
     pub clipboard_write: bool,
+    /// Spinners turn while agents work; off, they stand still and save CPU.
+    #[serde(skip_serializing_if = "is_true")]
+    pub spinners: bool,
     /// A draggable scroll position thumb at a terminal pane's right edge.
     #[serde(skip_serializing_if = "is_true")]
     pub pane_scrollbars: bool,
@@ -454,6 +457,7 @@ impl Default for Person {
             ui_font: None,
             telemetry: true,
             clipboard_write: true,
+            spinners: true,
             pane_scrollbars: true,
             minimum_contrast: 1.0,
             option_as_alt: OptionAsAlt::Auto,
@@ -492,6 +496,7 @@ pub struct Settings {
     /// 0..1: below 1, what's behind a terminal shows through.
     pub terminal_opacity: f32,
     pub clipboard_write: bool,
+    pub spinners: bool,
     pub minimum_contrast: f32,
     pub option_as_alt: OptionAsAlt,
     pub sounds: Sounds,
@@ -534,6 +539,7 @@ impl Default for Settings {
             terminal_padding: [10.0, 6.0],
             terminal_opacity: 1.0,
             clipboard_write: true,
+            spinners: true,
             minimum_contrast: 1.0,
             option_as_alt: OptionAsAlt::Auto,
             sounds: Sounds::default(),
@@ -573,6 +579,7 @@ impl Settings {
             terminal_opacity: look.terminal_opacity.unwrap_or(1.0).clamp(0.0, 1.0),
             sounds: person.sounds.clone(),
             clipboard_write: person.clipboard_write,
+            spinners: person.spinners,
             minimum_contrast: person.minimum_contrast,
             option_as_alt: person.option_as_alt,
         }
@@ -710,6 +717,7 @@ pub fn set(s: Settings) -> bool {
             return false;
         }
         gpui_shell::set_pixel_scale(s.zoom);
+        gpui_shell::set_spinners(s.spinners);
         *c.borrow_mut() = (Rc::new(s), Rc::new(theme));
         true
     })
@@ -905,6 +913,16 @@ mod tests {
             assert_eq!(serde_json::to_value(person).unwrap()["minimum_contrast"], serde_json::json!(ratio));
             assert_eq!(settings.problems().is_empty(), (1.0..=21.0).contains(&ratio));
         }
+    }
+
+    #[test]
+    fn spinners_default_on_and_can_be_turned_off() {
+        let default: Person = serde_json::from_str("{}").unwrap();
+        assert!(Settings::compose(&default, &crate::layout::Look::default(), true).spinners);
+        assert!(serde_json::to_value(&default).unwrap().get("spinners").is_none());
+        let off: Person = serde_json::from_str(r#"{"spinners":false}"#).unwrap();
+        assert!(!Settings::compose(&off, &crate::layout::Look::default(), true).spinners);
+        assert_eq!(serde_json::to_value(off).unwrap()["spinners"], false);
     }
 
     #[test]

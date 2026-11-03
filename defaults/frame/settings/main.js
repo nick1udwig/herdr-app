@@ -483,6 +483,21 @@ export default class Settings extends View {
       .child(this.heading(t, "Layout"))
       .child(this.layoutPicker(t, cx))
       .child(div().h(18))
+      .child(this.heading(t, "Motion"))
+      .child(
+        this.row(
+          t,
+          "Spinners",
+          "Turn while agents work. Off, they stand still and Herdr uses less CPU.",
+          this.toggle(t, "st-spinners", this.person.spinners !== false, (_e, cx) =>
+            this.change((p) => {
+              if (p.spinners === false) delete p.spinners;
+              else p.spinners = false;
+            }, cx),
+          ),
+        ),
+      )
+      .child(div().h(18))
       .child(this.heading(t, "Theme"))
       .child(this.row(t, "Appearance", "Light or dark, or as your system is now.", this.appearancePicker(t, cx)))
       .child(div().pt(12).pb(8).text_size(12.5).text_color(t.dim).child("For the layout you're in: each layout keeps its own light and dark theme."))

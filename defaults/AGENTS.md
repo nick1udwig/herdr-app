@@ -706,6 +706,9 @@ What's about the user, never a look:
   background; this is a threshold, not a guaranteed resulting ratio.
   Box/block, Powerline and sprite glyph colors are never adjusted.
   Changes apply immediately, including text already on screen.
+- `spinners`: `false` stops SVG `.spin()` and text `.frames()` spinners at their first frame to save CPU; on when absent.
+  Available in Settings → Look.
+  Changes apply immediately.
 - `clipboard_write`: `false` blocks terminal programs from writing the local
   clipboard (default `true`, including remote terminals attached in this window).
   OSC 52 accepts base64 UTF-8 text up to 1 MiB: `c` writes the system clipboard,

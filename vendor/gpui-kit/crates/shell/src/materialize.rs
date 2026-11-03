@@ -1439,8 +1439,9 @@ fn materialize_component(
             // still wins and an icon in a dark button comes out light.
             warn_unhonoured_a11y(&behavior, "svg", &[]);
             let path = crate::AppAssets::cache_key(&path);
-            // HERDR: `spin`.
-            if let Some(ms) = behavior.spin
+            // HERDR: `spin`, unless spinners are off (then a still icon).
+            let spin = behavior.spin.filter(|_| crate::value::spinners());
+            if let Some(ms) = spin
                 && HOSTED.with(|h| h.get())
                 && !checking()
             {
@@ -1449,7 +1450,7 @@ fn materialize_component(
             let mut image = gpui::svg().path(path);
             image.style().refine(&refinement);
             image.style().text.color = Some(inherited);
-            if let Some(ms) = behavior.spin {
+            if let Some(ms) = spin {
                 let turn = (loop_clock_ms() % ms) / ms;
                 image = image.with_transformation(gpui::Transformation::rotate(gpui::radians((turn * std::f64::consts::TAU) as f32)));
                 // ~10 fps: a small spinner looks the same, and each step redraws its whole view.
@@ -2887,8 +2888,9 @@ pub(crate) fn spin_layer(view: gpui::EntityId) -> AnyElement {
                 return;
             }
             let scale = window.scale_factor();
+            let turning = crate::value::spinners();
             for s in spins {
-                let turn = (loop_clock_ms() % s.ms) / s.ms;
+                let turn = if turning { (loop_clock_ms() % s.ms) / s.ms } else { 0.0 };
                 let center = s.bounds.center();
                 let matrix = gpui::TransformationMatrix::unit()
                     .translate(center.scale(scale))
@@ -2898,7 +2900,9 @@ pub(crate) fn spin_layer(view: gpui::EntityId) -> AnyElement {
                     let _ = window.paint_svg(s.bounds, s.path, None, matrix, s.color, cx);
                 });
             }
-            wake_view_after(Duration::from_millis(100), window, cx);
+            if turning {
+                wake_view_after(Duration::from_millis(100), window, cx);
+            }
         },
     )
     .absolute()
@@ -2937,6 +2941,10 @@ fn apply_loops<'a>(behavior: &'a Behavior, refinement: &mut StyleRefinement, win
     }
     let now = loop_clock_ms();
     let text = behavior.frames.as_ref().map(|(ms, list)| {
+        // HERDR: text spinners stand still without scheduling redraws when disabled.
+        if !crate::value::spinners() {
+            return (0, list.as_slice());
+        }
         let step = (now / ms).floor();
         let delay = Duration::from_secs_f64(((step + 1.0) * ms - now).max(1.0) / 1000.0);
         wake_view_at(cx.background_executor().now() + delay, window, cx);

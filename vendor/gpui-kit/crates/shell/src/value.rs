@@ -7,11 +7,22 @@
 
 use crate::error::{Result as ShellResult, ShellError};
 use gpui::{Hsla, Pixels, px, rgba};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // HERDR: one app-wide zoom applied to every pixel length a script writes, so
 // zooming the host app zooms every script view with it.
 static PIXEL_SCALE: AtomicU32 = AtomicU32::new(0x3f80_0000); // 1.0
+
+/// HERDR: whether `spin` and `frames` animate; off, spinners stand still without waking their views.
+static SPINNERS: AtomicBool = AtomicBool::new(true);
+
+pub fn set_spinners(on: bool) {
+    SPINNERS.store(on, Ordering::Relaxed);
+}
+
+pub(crate) fn spinners() -> bool {
+    SPINNERS.load(Ordering::Relaxed)
+}
 
 /// Sets the zoom applied to script pixel lengths (1 = as written).
 pub fn set_pixel_scale(scale: f32) {
