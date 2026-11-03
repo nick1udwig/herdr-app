@@ -70,15 +70,23 @@ export default class Spaces extends View {
     // `git status` walks the whole tree, on another machine a process there:
     // only when its answer could have changed (see `due`).
     cx.timer.every(250, (cx) => this.checkNew(cx));
+    this.checkDue = true;
+    this.nextCheck = 0;
   }
 
   checkNew(cx) {
     const now = Date.now();
+    if (!this.checkDue && now < this.nextCheck) return;
+    this.checkDue = false;
     const sp = spaces();
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
     const due = this.due(now, sp, panes());
     if (due.size) this.refreshGit(due, cx);
-    if (sp.some((s) => !this.shown.has(s.id)) || this.orderingDue(now)) cx.notify();
+    const waiting = sp.some((s) => !this.shown.has(s.id));
+    this.nextCheck = Math.min(now + FALLBACK, ...Object.values(this.checked).map(at => at + FALLBACK + 1).filter(at => at > now));
+    if (waiting) this.nextCheck = Math.min(this.nextCheck, now + 250);
+    if (this.ordering && this.ordering.at + 1000 > now) this.nextCheck = Math.min(this.nextCheck, this.ordering.at + 1000);
+    if (waiting || this.orderingDue(now)) cx.notify();
   }
 
   // Places whose git could have changed: new ones (a new space, a cd), where a
@@ -439,6 +447,7 @@ export default class Spaces extends View {
   }
 
   render() {
+    this.checkDue = true;
     const t = theme();
     const collapsed = narrow();
     const palette = ["ansi6", "ansi3", "ansi4", "ansi5", "ansi2", "ansi1"];

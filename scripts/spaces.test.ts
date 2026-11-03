@@ -6,6 +6,7 @@ const source = (await readFile(new URL("../defaults/mods/spaces/main.js", import
 
 type Space = { id: string; folder: string; machine?: string | null };
 function harness(replies: unknown[] = [], storage = new Map<string, string>(), snapshot: Space[] = []) {
+  const reads = { spaces: 0 };
   const calls: string[][] = [];
   const tasks: Promise<unknown>[] = [];
   const availability = [{ name: null as string | null, layout: "ready" }];
@@ -24,7 +25,7 @@ function harness(replies: unknown[] = [], storage = new Map<string, string>(), s
       return reply ?? { code: 0, stdout: "{}", stderr: "" };
     },
     { setItem(key: string, value: string) { storage.set(key, value); }, getItem(key: string) { return storage.get(key) ?? null; } },
-    () => snapshot, () => [],
+    () => { reads.spaces++; return snapshot; }, () => [],
     (name: string, args: { id: string; index: number }) => {
       expect(name).toBe("space.move");
       moves.push(args);
@@ -36,7 +37,7 @@ function harness(replies: unknown[] = [], storage = new Map<string, string>(), s
   view.folded = new Set(["cloud"]);
   view.refreshMachines = () => {};
   const cx = { timer: { every() {} }, notify() {}, spawn(fn: (cx: unknown) => Promise<unknown>) { tasks.push(fn(cx)); } };
-  return { view, calls, tasks, cx, storage, moves, handlers, snapshot, availability };
+  return { view, calls, tasks, cx, storage, moves, handlers, snapshot, availability, reads };
 }
 
 const machine = { name: "cloud", id: "old", target: "user@host", session: null, via: false };
@@ -118,6 +119,7 @@ test("unexpected transport failures clear the busy state", async () => {
 function orderedHarness(ids: string[]) {
   const h = harness([], new Map(), ids.map(id => ({ id, folder: "/" + id })));
   h.view.git = {};
+  h.view.checked = {};
   h.view.shown = new Set(ids);
   h.view.born = {};
   h.view.pressed = null;
@@ -279,4 +281,43 @@ test("no reconciliation without a rendered sidebar", () => {
   h.rows();
   h.flush();
   expect(h.order()).toEqual(["main", "topic"]);
+});
+
+
+test("quiet sidebar ticks skip snapshots until a fallback or changed view", () => {
+  const { view, cx, reads } = harness();
+  const clock = spyOn(Date, "now").mockReturnValue(1000);
+  try {
+    view.init({}, cx);
+    view.due = () => new Set();
+    view.checkNew(cx);
+    const initial = reads.spaces;
+    for (let at = 1250; at < 61000; at += 250) {
+      clock.mockReturnValue(at);
+      view.checkNew(cx);
+    }
+    expect(reads.spaces).toBe(initial);
+    clock.mockReturnValue(61000);
+    view.checkNew(cx);
+    expect(reads.spaces).toBe(initial + 1);
+    view.checkDue = true;
+    view.checkNew(cx);
+    expect(reads.spaces).toBe(initial + 2);
+  } finally { clock.mockRestore(); }
+});
+
+test("new sidebar spaces keep their short discovery deadline", () => {
+  const { view, cx, snapshot } = harness();
+  const clock = spyOn(Date, "now").mockReturnValue(1000);
+  try {
+    view.init({}, cx);
+    view.due = () => new Set();
+    snapshot.push({ id: "new", folder: "/repo" });
+    view.checkNew(cx);
+    expect(view.nextCheck).toBe(1250);
+    view.shown.add("new");
+    clock.mockReturnValue(1250);
+    view.checkNew(cx);
+    expect(view.nextCheck).toBe(61250);
+  } finally { clock.mockRestore(); }
 });
