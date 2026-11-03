@@ -126,10 +126,10 @@ pub struct TerminalView {
     _reader: Option<Task<()>>,
 }
 
-thread_local! {
-    /// Terminals with output waiting for the next tick of the output clock.
-    static OUTPUT_CLOCK: RefCell<Vec<WeakEntity<TerminalView>>> = const { RefCell::new(Vec::new()) };
-}
+/// How long after typing a terminal's output keeps the full frame rate.
+const ATTENDED: Duration = Duration::from_secs(2);
+/// Between draws of output nobody is typing into: 10 a second, in step with spinners.
+const UNATTENDED_STEP: Duration = Duration::from_millis(100);
 
 /// The window's frame number, counted where the window renders.
 static FRAME: AtomicU64 = AtomicU64::new(0);
@@ -482,36 +482,29 @@ impl TerminalView {
         // Output in a terminal nobody sees doesn't redraw the window; it's
         // drawn fresh when shown again. Nor does output that changed nothing
         // on screen (an agent spinning its title).
-        if self.shown_in.get() == FRAME.load(Ordering::Relaxed) && self.grid.borrow_mut().vt.shows_change() {
+        if self.shown_in.get() == FRAME.load(Ordering::Relaxed) {
             self.redraw_soon(cx);
         }
         open
     }
 
-    /// Output is drawn on a shared clock (~30 a second), so panes printing
-    /// out of step share window frames; right after typing, at once.
+    /// Output is drawn on the frame clock shared with spinners, so panes
+    /// printing out of step and spinners turning share window frames: right
+    /// after typing at once, then 30 a second for a while, else 10 (an
+    /// agent's status line animating while nobody types).
     fn redraw_soon(&self, cx: &mut Context<Self>) {
-        if self.typed_at.get().is_some_and(|t| t.elapsed() < Duration::from_millis(200)) {
-            cx.notify();
+        let since_typed = self.typed_at.get().map(|t| t.elapsed());
+        if since_typed.is_some_and(|t| t < Duration::from_millis(200)) {
+            if self.grid.borrow_mut().vt.shows_change() { cx.notify(); }
             return;
         }
+        let after = if since_typed.is_some_and(|t| t < ATTENDED) { Duration::ZERO } else { UNATTENDED_STEP };
         let me = cx.entity().downgrade();
-        let start = OUTPUT_CLOCK.with(|c| {
-            let mut c = c.borrow_mut();
-            if !c.iter().any(|w| w.entity_id() == me.entity_id()) {
-                c.push(me);
-            }
-            c.len() == 1
+        gpui_shell::frame_clock::wake(me.entity_id(), after, cx, move |cx| {
+            let _ = me.update(cx, |view, cx| {
+                if view.grid.borrow_mut().vt.shows_change() { cx.notify(); }
+            });
         });
-        if start {
-            cx.spawn(async |_, cx| {
-                cx.background_executor().timer(Duration::from_millis(33)).await;
-                for view in OUTPUT_CLOCK.with(|c| std::mem::take(&mut *c.borrow_mut())) {
-                    let _ = view.update(cx, |_, cx| cx.notify());
-                }
-            })
-            .detach();
-        }
     }
 
     /// The window puts this terminal on screen in the frame it's building.
@@ -2144,6 +2137,112 @@ mod tests {
         assert!(matches!(&batch[1], Stream::Closed(_)));
         assert!(matches!(&batch[2], Stream::Data(bytes) if bytes.len() == 64 * 1024));
         assert!(matches!(&batch[3], Stream::Data(bytes) if bytes == b"y"));
+    }
+
+    #[gpui::test]
+    fn queued_title_only_output_does_not_redraw(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        use std::{cell::Cell, rc::Rc, time::Duration};
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (40, 5), cx));
+        cx.run_until_parked();
+        let notifications = Rc::new(Cell::new(0));
+        let count = notifications.clone();
+        let _subscription = cx.update(|cx| cx.observe(&terminal, move |_, _| count.set(count.get() + 1)));
+        terminal.update(cx, |view, cx| {
+            view.grid.borrow_mut().vt.frame();
+            view.grid.borrow_mut().vt.write(b"\x1b]2;title\x07");
+            view.redraw_soon(cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(33));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 0);
+    }
+
+    #[gpui::test]
+    fn output_and_other_scheduled_redraws_share_a_frame_clock_tick(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        use std::{cell::Cell, rc::Rc, time::Duration};
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (40, 5), cx));
+        let spinner = cx.new(|_| ());
+        cx.run_until_parked();
+        let (drawn, turned) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        let count = drawn.clone();
+        let _subscription = cx.update(|cx| cx.observe(&terminal, move |_, _| count.set(count.get() + 1)));
+        // The clock's grid starts at its first wake.
+        let first = cx.new(|_| ());
+        cx.update(|cx| gpui_shell::frame_clock::wake(first.entity_id(), Duration::ZERO, cx, |_| {}));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(5));
+        terminal.update(cx, |view, cx| {
+            view.grid.borrow_mut().vt.frame();
+            view.grid.borrow_mut().vt.write(b"x");
+            view.redraw_soon(cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(20));
+        // A spinner's step asked for later in the same tick lands on the same tick.
+        let step = turned.clone();
+        cx.update(|cx| gpui_shell::frame_clock::wake(spinner.entity_id(), Duration::from_millis(100), cx, move |_| step.set(step.get() + 1)));
+        cx.executor().advance_clock(Duration::from_millis(70));
+        cx.run_until_parked();
+        assert_eq!((drawn.get(), turned.get()), (0, 0));
+        cx.executor().advance_clock(Duration::from_millis(10));
+        cx.run_until_parked();
+        assert_eq!((drawn.get(), turned.get()), (1, 1));
+    }
+
+    #[gpui::test]
+    fn output_bursts_share_one_redraw_deadline(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        use std::{cell::Cell, rc::Rc, time::Duration};
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (40, 5), cx));
+        cx.run_until_parked();
+        let notifications = Rc::new(Cell::new(0));
+        let count = notifications.clone();
+        let _subscription = cx.update(|cx| cx.observe(&terminal, move |_, _| count.set(count.get() + 1)));
+        terminal.update(cx, |view, cx| view.redraw_soon(cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(10));
+        terminal.update(cx, |view, cx| view.redraw_soon(cx));
+        cx.run_until_parked();
+        // Nobody typed: output draws every third 33.3 ms tick.
+        cx.executor().advance_clock(Duration::from_millis(89));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 0);
+        cx.executor().advance_clock(Duration::from_millis(2));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 1);
+        terminal.update(cx, |view, cx| view.redraw_soon(cx));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 1, "an earlier burst must not flush the next frame early");
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 2);
+    }
+
+    #[gpui::test]
+    fn output_after_typing_draws_on_every_tick(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        use std::{cell::Cell, rc::Rc, time::{Duration, Instant}};
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t1".into(), (40, 5), cx));
+        cx.run_until_parked();
+        let notifications = Rc::new(Cell::new(0));
+        let count = notifications.clone();
+        let _subscription = cx.update(|cx| cx.observe(&terminal, move |_, _| count.set(count.get() + 1)));
+        terminal.update(cx, |view, cx| {
+            view.typed_at.set(Some(Instant::now() - Duration::from_millis(500)));
+            view.redraw_soon(cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(34));
+        cx.run_until_parked();
+        assert_eq!(notifications.get(), 1);
     }
 
     #[gpui::test]

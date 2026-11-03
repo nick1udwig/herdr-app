@@ -2767,10 +2767,6 @@ fn loop_clock_ms() -> f64 {
     EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
-thread_local! {
-    static LOOP_WAKES: RefCell<std::collections::HashMap<gpui::EntityId, std::time::Instant>> =
-        RefCell::new(std::collections::HashMap::new());
-}
 
 // HERDR: a spinner in a view a ShellRoot shows is drawn by that ShellRoot.
 // The view lays out an empty slot that says where it is; ShellRoot paints it
@@ -2911,38 +2907,26 @@ pub(crate) fn spin_layer(view: gpui::EntityId) -> AnyElement {
 }
 
 /// Draws the view being rendered again after `delay`, once, however many of
-/// its elements ask.
+/// its elements ask. HERDR: on the shared frame clock, so spinners and other
+/// scheduled redraws due together share one frame.
 fn wake_view_after(delay: Duration, window: &Window, cx: &mut App) {
     if checking() {
         return;
     }
     let view = window.current_view();
-    let now = std::time::Instant::now();
-    let at = now + delay;
-    let schedule = LOOP_WAKES.with(|wakes| {
-        let mut wakes = wakes.borrow_mut();
-        match wakes.get(&view) {
-            Some(pending) if *pending > now && *pending <= at => false,
-            _ => {
-                wakes.insert(view, at);
-                true
-            }
-        }
-    });
-    if !schedule {
+    if delay.is_zero() {
+        cx.defer(move |cx| cx.notify(view));
         return;
     }
-    cx.spawn(async move |cx| {
-        cx.background_executor().timer(delay).await;
-        LOOP_WAKES.with(|wakes| {
-            let mut wakes = wakes.borrow_mut();
-            if wakes.get(&view) == Some(&at) {
-                wakes.remove(&view);
-            }
-        });
-        cx.update(|cx| cx.notify(view));
-    })
-    .detach();
+    crate::frame_clock::wake(view, delay, cx, move |cx| cx.notify(view));
+}
+
+fn wake_view_at(deadline: std::time::Instant, window: &Window, cx: &mut App) {
+    if checking() {
+        return;
+    }
+    let view = window.current_view();
+    crate::frame_clock::wake_at(view, deadline, cx, move |cx| cx.notify(view));
 }
 
 /// Applies `loop`s to the refinement; with `frames`, returns the frames and
@@ -2952,10 +2936,10 @@ fn apply_loops<'a>(behavior: &'a Behavior, refinement: &mut StyleRefinement, win
         return None;
     }
     let now = loop_clock_ms();
-    let mut next = f64::INFINITY;
     let text = behavior.frames.as_ref().map(|(ms, list)| {
         let step = (now / ms).floor();
-        next = next.min((step + 1.0) * ms - now);
+        let delay = Duration::from_secs_f64(((step + 1.0) * ms - now).max(1.0) / 1000.0);
+        wake_view_at(cx.background_executor().now() + delay, window, cx);
         ((step as usize) % list.len(), list.as_slice())
     });
     for l in &behavior.loops {
@@ -2975,9 +2959,10 @@ fn apply_loops<'a>(behavior: &'a Behavior, refinement: &mut StyleRefinement, win
             MotionProperty::Left => refinement.inset.left = Some(gpui::px(value).into()),
             MotionProperty::Top => refinement.inset.top = Some(gpui::px(value).into()),
         }
-        next = next.min(1000.0 / 30.0);
     }
-    wake_view_after(Duration::from_secs_f64(next.max(1.0) / 1000.0), window, cx);
+    if !behavior.loops.is_empty() {
+        wake_view_after(Duration::from_secs_f64(1.0 / 30.0), window, cx);
+    }
     text
 }
 

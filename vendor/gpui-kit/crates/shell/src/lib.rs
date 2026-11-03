@@ -72,6 +72,8 @@ pub use input_tokens::{
 };
 pub(crate) mod dependencies;
 pub mod dock;
+/// HERDR: shared tick for scheduled redraws.
+pub mod frame_clock;
 pub(crate) mod engine;
 pub(crate) mod entities;
 pub(crate) mod error;
