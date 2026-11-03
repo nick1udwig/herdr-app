@@ -30,7 +30,7 @@ use x11rb::{
 };
 
 use std::{
-    cell::RefCell, ffi::c_void, fmt::Display, num::NonZeroU32, ptr::NonNull, rc::Rc, sync::Arc,
+    cell::{Cell, RefCell}, ffi::c_void, fmt::Display, num::NonZeroU32, ptr::NonNull, rc::Rc, sync::Arc,
 };
 
 use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
@@ -284,7 +284,6 @@ pub struct X11WindowState {
     /// `VisibilityNotify`; this is the last value it reported.
     visibility: WindowVisibility,
     hovered: bool,
-    force_render_after_recovery: bool,
     fullscreen: bool,
     client_side_decorations_supported: bool,
     decorations: WindowDecorations,
@@ -313,6 +312,44 @@ pub(crate) struct X11WindowStatePtr {
     pub(crate) callbacks: Rc<RefCell<Callbacks>>,
     xcb: Rc<XCBConnection>,
     pub(crate) x_window: xproto::Window,
+    frames: Rc<FrameState>,
+}
+
+struct FrameState {
+    requested: Cell<bool>,
+    force_render: Cell<bool>,
+    ping: calloop::ping::Ping,
+}
+
+impl FrameState {
+    fn new(ping: calloop::ping::Ping) -> Self {
+        Self {
+            requested: Cell::new(true),
+            force_render: Cell::new(false),
+            ping,
+        }
+    }
+
+    fn schedule(&self) {
+        if !self.requested.replace(true) { self.ping.ping(); }
+    }
+
+    fn schedule_after_recovery(&self) {
+        self.force_render.set(true);
+        self.schedule();
+    }
+
+    fn begin_frame(&self) {
+        self.requested.set(false);
+    }
+
+    fn take_force_render(&self) -> bool {
+        self.force_render.replace(false)
+    }
+
+    fn needs_frame(&self) -> bool {
+        self.requested.get() || self.force_render.get()
+    }
 }
 
 impl rwh::HasWindowHandle for RawWindow {
@@ -843,7 +880,6 @@ impl X11WindowState {
                 // The window is not mapped until the client sees `MapNotify`.
                 visibility: WindowVisibility::Hidden,
                 hovered: false,
-                force_render_after_recovery: false,
                 fullscreen: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
@@ -935,6 +971,7 @@ impl X11Window {
         parent_window: Option<X11WindowStatePtr>,
         supports_xinput_gestures: bool,
         is_bgr: bool,
+        frame_ping: calloop::ping::Ping,
     ) -> anyhow::Result<Self> {
         let ptr = X11WindowStatePtr {
             state: Rc::new(RefCell::new(X11WindowState::new(
@@ -955,6 +992,7 @@ impl X11Window {
                 supports_xinput_gestures,
                 is_bgr,
             )?)),
+            frames: Rc::new(FrameState::new(frame_ping)),
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
             xcb: xcb.clone(),
             x_window,
@@ -1181,13 +1219,20 @@ impl X11WindowStatePtr {
         }
     }
 
+    pub(crate) fn needs_frame(&self) -> bool {
+        self.frames.needs_frame()
+    }
+
+    pub(crate) fn begin_frame(&self) {
+        self.frames.begin_frame();
+    }
+
     pub fn refresh(&self, mut request_frame_options: RequestFrameOptions) {
         let callback = self.callbacks.borrow_mut().request_frame.take();
         if let Some(mut fun) = callback {
             // Expose events can present a frame before the refresh timer runs,
             // so every frame request must rebuild stale atlas references after recovery.
-            request_frame_options.force_render |=
-                std::mem::take(&mut self.state.borrow_mut().force_render_after_recovery);
+            request_frame_options.force_render |= self.frames.take_force_render();
             fun(request_frame_options);
             self.callbacks.borrow_mut().request_frame = Some(fun);
         }
@@ -1697,6 +1742,15 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().fullscreen
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let frames = self.0.frames.clone();
+        Some(Rc::new(move || frames.schedule()))
+    }
+
+    fn schedule_frame(&self) {
+        self.0.frames.schedule();
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
     }
@@ -1776,14 +1830,14 @@ impl PlatformWindow for X11Window {
                 }
             }
 
-            inner.force_render_after_recovery = true;
+            self.0.frames.schedule_after_recovery();
             return;
         }
 
         renderer.draw(scene);
 
         if renderer.needs_redraw() {
-            inner.force_render_after_recovery = true;
+            self.0.frames.schedule_after_recovery();
         }
     }
 
@@ -2068,5 +2122,47 @@ struct TrivialDeactivationHandler {
 impl accesskit::DeactivationHandler for TrivialDeactivationHandler {
     fn deactivate_accessibility(&mut self) {
         (self.callback)();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameState;
+    use std::time::Duration;
+
+    #[test]
+    fn recovery_wakes_parked_frame_source_and_forces_retry() {
+        let mut event_loop = calloop::EventLoop::<usize>::try_new().unwrap();
+        let (ping, source) = calloop::ping::make_ping().unwrap();
+        event_loop
+            .handle()
+            .insert_source(source, |_, _, wakes| *wakes += 1)
+            .unwrap();
+        let frames = FrameState::new(ping);
+        let mut wakes = 0;
+
+        frames.begin_frame();
+        assert!(!frames.needs_frame());
+        event_loop.dispatch(Duration::ZERO, &mut wakes).unwrap();
+        assert_eq!(wakes, 0);
+
+        for retry in 1..=3 {
+            // An expose can detect device loss while the refresh timer is parked.
+            frames.schedule_after_recovery();
+            frames.schedule_after_recovery();
+            event_loop.dispatch(Duration::ZERO, &mut wakes).unwrap();
+            assert_eq!(wakes, retry, "recovery must wake the frame source once");
+
+            frames.begin_frame();
+            assert!(
+                frames.needs_frame(),
+                "recovery must keep the forced draw pending"
+            );
+            assert!(frames.take_force_render());
+            assert!(!frames.take_force_render());
+            assert!(!frames.needs_frame(), "a successful retry must allow parking");
+            event_loop.dispatch(Duration::ZERO, &mut wakes).unwrap();
+            assert_eq!(wakes, retry, "idle frames must not keep waking");
+        }
     }
 }
