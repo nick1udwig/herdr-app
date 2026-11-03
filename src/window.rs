@@ -1053,6 +1053,7 @@ impl AppWindow {
         if QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
+        for slot in self.documents.values_mut() { slot.local_dirty = true; }
         self.note_pane_folders();
         let mut state = layout_sync::State::between(&self.file_chrome, &self.chrome);
         state.theme = self.picked_theme.clone();
@@ -1798,9 +1799,10 @@ impl AppWindow {
         let generation = self.core_generation;
         for (machine, slot) in &mut self.documents {
             slot.dirty |= refresh;
-            if !slot.ready() { continue; }
+            if !slot.needs_capture() { continue; }
             let doc = crate::mirror::Document::capture(&self.model, (!machine.is_empty()).then_some(machine.as_str()));
             let write = (self.drag.is_none() && slot.available && slot.document.as_ref() != Some(&doc)).then_some(doc);
+            if self.drag.is_none() { slot.local_dirty = false; }
             if write.is_none() && slot.available && !slot.dirty { continue; }
             let (tx, rx) = std::sync::mpsc::channel();
             slot.pending = Some(rx);

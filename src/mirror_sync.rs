@@ -16,6 +16,7 @@ pub struct Slot {
     connected_since: Option<u64>,
     pub pending: Option<mpsc::Receiver<Outcome>>,
     pub dirty: bool,
+    pub local_dirty: bool,
     pub blocked: bool,
     pub error: Option<String>,
     pub notified_error: Option<String>,
@@ -30,6 +31,10 @@ impl Slot {
 
     pub fn ready(&self) -> bool {
         self.connected && self.pending.is_none() && (!self.blocked || self.dirty)
+    }
+
+    pub fn needs_capture(&self) -> bool {
+        self.ready() && (!self.available || self.dirty || self.local_dirty)
     }
 
     pub fn connection(&mut self, connected: bool, since: Option<u64>, reason: Option<String>) {
@@ -113,6 +118,29 @@ pub fn round_timeout(core: &Core, work: Work, timeout: Duration) -> (String, Out
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_documents_skip_capture_and_pending_writes_keep_new_edits() {
+        let mut slot = Slot { connected: true, available: true, ..Default::default() };
+        assert!(!slot.needs_capture());
+        slot.local_dirty = true;
+        let (_, rx) = mpsc::channel();
+        slot.pending = Some(rx);
+        assert!(!slot.needs_capture());
+        slot.pending = None;
+        assert!(slot.needs_capture());
+        slot.local_dirty = false;
+        slot.dirty = true;
+        assert!(slot.needs_capture());
+        slot.dirty = false;
+        slot.available = false;
+        assert!(slot.needs_capture());
+        slot.blocked = true;
+        assert!(!slot.needs_capture());
+        slot.connection(false, None, None);
+        slot.connection(true, None, None);
+        assert!(slot.needs_capture());
+    }
 
     #[test]
     fn layout_loading_ends_on_read_failure_and_restarts_on_reconnect() {
