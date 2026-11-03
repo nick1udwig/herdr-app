@@ -1,5 +1,5 @@
 use super::*;
-use gpui::{IntoElement, Render, TestAppContext, VisualTestContext};
+use gpui::{AppContext as _, IntoElement, Render, TestAppContext, VisualTestContext};
 use std::ops::Deref;
 use gpui_shell::{ShellRoot, ShellRuntime, policy::Policy};
 use std::{cell::Cell, rc::Rc, sync::atomic::{AtomicU64, Ordering}, time::Instant};
@@ -319,5 +319,68 @@ export default class extends View {
     window.update(cx, |_, window, cx| runtime.close(&root, start + Duration::from_millis(15), window, cx).detach()).unwrap();
     assert!(start.elapsed() < Duration::from_millis(200));
     cx.run_until_parked();
+    window.update(cx, |_, window, _| window.remove_window()).unwrap();
+}
+
+#[gpui::test]
+fn dismissing_a_hovered_toast_does_not_pause_the_next_toast(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let content = cx.new(|_| Empty).into();
+        ShellRoot::new(content, window, cx)
+    });
+
+    for clear in [false, true] {
+        root.update_in(cx, |root, window, cx| {
+            root.push_toast(gpui_shell::ToastRequest::new("Saved").with_id("saved"), window, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let hovered = cx.update(|window, _| gpui::point(window.viewport_size().width - gpui::px(40.), gpui::px(40.)));
+        cx.simulate_mouse_move(hovered, None, gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        root.update(cx, |root, cx| {
+            if clear {
+                root.clear_toasts(cx);
+            } else {
+                assert!(root.remove_toast("saved", cx));
+            }
+        });
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert_eq!(root.read_with(cx, |root, _| root.toast_count()), 0);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.simulate_mouse_move(gpui::point(gpui::px(10.), gpui::px(400.)), None, gpui::Modifiers::default());
+
+        root.update_in(cx, |root, window, cx| {
+            root.push_toast(gpui_shell::ToastRequest::new("Next").with_timeout(Some(Duration::from_secs(1))), window, cx);
+        });
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        assert_eq!(root.read_with(cx, |root, _| root.toast_count()), 0, "a new toast inherited the removed stack's hover state");
+    }
+}
+
+#[gpui::test]
+fn a_mod_root_sets_no_timer_unless_a_toast_is_showing(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let fixture = Fixture::new(r#"
+import { View, div } from "gpui-kit";
+export default class extends View { render() { return div(); } }"#);
+    gpui_shell::policy::set_default(Policy::new());
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let window = cx.add_window(|_, _| Empty);
+    let root = window.update(cx, |_, window, cx| runtime.try_load(&fixture.0, window, cx).unwrap()).unwrap();
+    cx.run_until_parked();
+    assert!(!cx.dispatcher.advance_clock_to_next_timer(), "an idle root wakes on a timer");
+    window.update(cx, |_, window, cx| root.update(cx, |root, cx| {
+        root.push_toast(gpui_shell::ToastRequest::new("Saved").with_timeout(Some(Duration::from_secs(1))), window, cx);
+    })).unwrap();
+    cx.executor().advance_clock(Duration::from_secs(3));
+    cx.run_until_parked();
+    assert_eq!(root.read_with(cx, |root, _| root.toast_count()), 0);
+    assert!(!cx.dispatcher.advance_clock_to_next_timer(), "the toast clock outlived its toasts");
     window.update(cx, |_, window, _| window.remove_window()).unwrap();
 }

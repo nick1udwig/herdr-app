@@ -147,6 +147,8 @@ pub struct ShellRoot {
     /// Source of ids for toasts pushed without one. Monotonic so that a
     /// replaced id can never collide with a live toast.
     next_toast_ordinal: u64,
+    /// HERDR: the toast clock runs only while toasts are mounted.
+    toast_clock_running: bool,
     /// The window's one tooltip layer. Base owns the delay, the grace period
     /// between two triggers and the paint priority; the root owns only the
     /// decision to have one, and what an appearing tooltip looks like.
@@ -217,9 +219,8 @@ impl ShellRoot {
     /// Takes an [`AnyView`] rather than an `Entity<ScriptView>` so the host can
     /// mount a Rust view too — the error screen a failed script load falls back
     /// to is not a `ScriptView`, and the root must be able to carry it.
-    pub fn new(content: AnyView, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(content: AnyView, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         install_key_bindings(cx);
-        Self::spawn_toast_clock(window, cx);
 
         Self {
             content,
@@ -232,6 +233,7 @@ impl ShellRoot {
             toast_state: ToastStackState::default(),
             toast_focus_handle: cx.focus_handle().tab_stop(true),
             next_toast_ordinal: 0,
+            toast_clock_running: false,
             tooltip_overlay: cx.new(|_| TooltipOverlay::new().render_with(render_tooltip)),
             fps_hud: None,
             fit_content: false,
@@ -528,6 +530,7 @@ impl ShellRoot {
         };
         self.toasts
             .push(id, toast, options, cx.background_executor().now());
+        self.start_toast_clock(cx);
         cx.notify();
     }
 
@@ -558,15 +561,27 @@ impl ShellRoot {
         }
     }
 
-    /// Samples the toast lifecycle clock forever, until the root is dropped.
+    /// Samples the toast lifecycle clock while any toast is mounted.
     ///
     /// Toast timeouts are the one part of this host that advances without any
-    /// input, so nothing else would wake the view to retire them.
-    fn spawn_toast_clock(window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
+    /// input, so nothing else would wake the view to retire them. HERDR: the
+    /// clock stops with the last toast, so a root without toasts never wakes.
+    fn start_toast_clock(&mut self, cx: &mut Context<Self>) {
+        if self.toast_clock_running {
+            return;
+        }
+        self.toast_clock_running = true;
+        cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(TOAST_TICK).await;
-                if this.update(cx, |this, cx| this.advance_toasts(cx)).is_err() {
+                let Ok(mounted) = this.update(cx, |this, cx| {
+                    this.advance_toasts(cx);
+                    this.toast_clock_running = !this.toasts.is_empty();
+                    this.toast_clock_running
+                }) else {
+                    break;
+                };
+                if !mounted {
                     break;
                 }
             }
@@ -583,6 +598,10 @@ impl ShellRoot {
             .advance(cx.background_executor().now(), paused)
             .changed
         {
+            if self.toasts.is_empty() {
+                // HERDR: an unmounted stack cannot observe the pointer leaving.
+                self.toast_state = ToastStackState::default();
+            }
             cx.notify();
         }
     }
@@ -877,7 +896,8 @@ impl Render for ShellRoot {
             })
             .children(self.sheet_layer(&colors, &spacing, cx))
             .children(self.dialog_layer(&colors, &radius, &spacing, cx))
-            .child(self.toast_layer(&colors, &radius, &spacing, cx))
+            // HERDR: no toasts, no stack: a deferred element is laid out as a root of its own.
+            .when(!self.toasts.is_empty(), |root| root.child(self.toast_layer(&colors, &radius, &spacing, cx)))
             .child(self.tooltip_overlay.clone())
             .children(self.fps_layer(window, cx))
     }
@@ -1545,6 +1565,27 @@ mod tests {
         cx.executor().advance_clock(Duration::from_secs(10));
         cx.run_until_parked();
         assert_eq!(root.read_with(cx, |root, _| root.toast_count()), 0);
+    }
+
+    #[gpui::test]
+    fn the_toast_clock_stops_with_the_last_toast_and_restarts_for_the_next(cx: &mut TestAppContext) {
+        let (root, cx) = shell_root(cx);
+        assert!(!root.read_with(cx, |root, _| root.toast_clock_running));
+
+        for _ in 0..2 {
+            root.update_in(cx, |root, window, cx| {
+                root.push_toast(
+                    ToastRequest::new("Saved").with_timeout(Some(Duration::from_secs(1))),
+                    window,
+                    cx,
+                )
+            });
+            assert!(root.read_with(cx, |root, _| root.toast_clock_running));
+            cx.executor().advance_clock(Duration::from_secs(3));
+            cx.run_until_parked();
+            assert_eq!(root.read_with(cx, |root, _| root.toast_count()), 0);
+            assert!(!root.read_with(cx, |root, _| root.toast_clock_running));
+        }
     }
 
     #[gpui::test]
