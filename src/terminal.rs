@@ -81,8 +81,8 @@ struct Grid {
     /// coordinates (wider than the few px drawn).
     thumb: Option<Bounds<Pixels>>,
     track: Option<Bounds<Pixels>>,
-    /// Each row's drawing by position, kept while the row is the same (`Rc`).
-    painted: Vec<(Rc<Vec<vt::Cell>>, Vec<RowOp>, Option<usize>)>,
+    /// Row identity keeps drawing operations valid when scrolling moves a row.
+    painted: HashMap<*const Vec<vt::Cell>, (Rc<Vec<vt::Cell>>, Vec<RowOp>, Option<usize>)>,
     /// Font size, cell size, font, loaded fonts and ligature setting used to draw.
     painted_with: (u32, Size<Pixels>, String, u64, bool),
 }
@@ -250,7 +250,7 @@ impl TerminalView {
                 cursor_at: None,
                 thumb: None,
                 track: None,
-                painted: Vec::new(),
+                painted: HashMap::new(),
                 painted_with: (0, Size::default(), String::new(), 0, false),
             })),
             focus: cx.focus_handle(),
@@ -1598,29 +1598,22 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
     let ligatures = crate::settings::get().font_ligatures;
     let cursor = frame.cursor_cell.filter(|_| ligatures);
     let with = (crate::settings::font_size().to_bits(), cell, crate::settings::terminal_font(), crate::settings::fonts_added(), ligatures);
-    // When every row changed (output scrolling), nothing is kept: the next
-    // frame would find none of them the same.
-    let mut painted = std::mem::take(&mut grid.borrow_mut().painted);
-    if grid.borrow().painted_with != with || frame.all {
-        painted.clear();
-    }
-    painted.truncate(frame.rows.len());
+    let mut previous = std::mem::take(&mut grid.borrow_mut().painted);
+    if grid.borrow().painted_with != with { previous.clear(); }
+    let mut painted = HashMap::with_capacity(frame.rows.len());
     for (y, row) in frame.rows.iter().enumerate() {
         let column = cursor.filter(|(_, cy)| *cy as usize == y).map(|(x, _)| x as usize);
-        if frame.all || painted.get(y).is_none_or(|(r, _, c)| !Rc::ptr_eq(r, row) || *c != column) {
-            let ops = row_ops(row, cell, column, window);
-            if y < painted.len() {
-                painted[y] = (row.clone(), ops, column);
-            } else {
-                painted.push((row.clone(), ops, column));
-            }
-        }
+        let key = Rc::as_ptr(row);
+        let cached = previous.remove(&key).filter(|(_, _, c)| *c == column)
+            .unwrap_or_else(|| (row.clone(), row_ops(row, cell, column, window), column));
+        painted.entry(key).or_insert(cached);
     }
 
     // Paint all program backgrounds first, then search overlays, then text.
     // This lets a match highlight sit below glyphs without contaminating
     // cached RowOps or the terminal's own selection/copy state.
-    for (y, (_, ops, _)) in painted.iter().enumerate() {
+    for (y, row) in frame.rows.iter().enumerate() {
+        let ops = &painted[&Rc::as_ptr(row)].1;
         for op in ops {
             match op {
                 RowOp::Bg { from, to, color } => {
@@ -1646,7 +1639,8 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
             window.paint_quad(fill(snap_box(b), highlight));
         }
     }
-    for (y, (_, ops, _)) in painted.iter().enumerate() {
+    for (y, row) in frame.rows.iter().enumerate() {
+        let ops = &painted[&Rc::as_ptr(row)].1;
         for op in ops {
             match op {
                 RowOp::Bg { .. } => {}

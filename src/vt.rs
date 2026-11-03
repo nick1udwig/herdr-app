@@ -105,8 +105,6 @@ pub struct Cursor {
 pub struct Frame {
     /// A row that didn't change since the last frame is the same `Rc`.
     pub rows: Vec<Rc<Vec<Cell>>>,
-    /// Every row changed (output scrolled, a resize, new colors): none is kept.
-    pub all: bool,
     pub cursor: Option<Cursor>,
     /// The cursor's cell even when the program hides it (agents draw their
     /// own): where input methods put their candidate window.
@@ -1550,7 +1548,6 @@ impl Vt {
                 let selection = selected.then_some((sel.start_x, sel.end_x));
                 let mut id = GhosttyRenderStateRowId::default();
                 let known = ghostty_render_state_row_get(self.rows_it, GHOSTTY_RENDER_STATE_ROW_DATA_ID, &mut id as *mut _ as *mut c_void) == GHOSTTY_SUCCESS;
-                // Everything changed: no row is kept (but each is remembered).
                 let mut row_dirty = true;
                 if !all {
                     ghostty_render_state_row_get(self.rows_it, GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY, &mut row_dirty as *mut _ as *mut c_void);
@@ -1566,7 +1563,9 @@ impl Vt {
                             row.push(self.read_cell(fg_default, selected && x >= sel.start_x && x <= sel.end_x));
                             x += 1;
                         }
-                        Rc::new(row)
+                        if with == self.seen_with && known && let Some((old, _)) = self.seen.get(&id.bits) && **old == row {
+                            old.clone()
+                        } else { Rc::new(row) }
                     }
                 };
                 if known {
@@ -1593,7 +1592,7 @@ impl Vt {
             self.drawn = self.drawable();
             ghostty_render_state_clean(state);
             let cursor_cell = cur.viewport_has_value.then_some((cur.viewport_x, cur.viewport_y));
-            Frame { rows, all, cursor, cursor_cell, bg: bg_default, search_spans: self.search_spans.clone() }
+            Frame { rows, cursor, cursor_cell, bg: bg_default, search_spans: self.search_spans.clone() }
         }
     }
 
@@ -1903,6 +1902,21 @@ mod tests {
         assert_eq!(f.rows[1][2].text, "!");
         let c = f.cursor.unwrap();
         assert_eq!((c.x, c.y), (3, 1));
+    }
+
+    #[test]
+    fn scrolling_keeps_unchanged_row_identity_but_not_changed_contents() {
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"one\r\ntwo\r\nthree");
+        let before = vt.frame();
+        vt.write(b"\r\nfour");
+        let scrolled = vt.frame();
+        assert!(Rc::ptr_eq(&before.rows[1], &scrolled.rows[0]));
+        assert!(Rc::ptr_eq(&before.rows[2], &scrolled.rows[1]));
+        vt.write(b"\x1b[1;1Hchanged");
+        let changed = vt.frame();
+        assert!(!Rc::ptr_eq(&scrolled.rows[0], &changed.rows[0]));
+        assert!(Rc::ptr_eq(&scrolled.rows[1], &changed.rows[1]));
     }
 
     #[test]
