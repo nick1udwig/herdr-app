@@ -29,6 +29,19 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+async fn next_core_event(events: Option<&async_channel::Receiver<crate::hc::Stream>>, deadline: impl std::future::Future<Output = ()>) -> Option<crate::hc::Stream> {
+    use std::future::Future;
+    let Some(events) = events else { deadline.await; return None };
+    let mut receive = std::pin::pin!(events.recv());
+    let mut deadline = std::pin::pin!(deadline);
+    std::future::poll_fn(|cx| {
+        if let std::task::Poll::Ready(event) = receive.as_mut().poll(cx) {
+            return std::task::Poll::Ready(Some(event.unwrap_or(crate::hc::Stream::Lost)));
+        }
+        deadline.as_mut().poll(cx).map(|()| None)
+    }).await
+}
+
 const HEADER_HEIGHT: f32 = 30.0;
 const HANDLE: f32 = 6.0;
 
@@ -616,7 +629,9 @@ impl AppWindow {
             let mut subscription = None;
             let mut subscribed_generation = u64::MAX;
             let mut event_lines = crate::hc::EventLines::default();
-            let (mut tick, mut relist) = (0u64, false);
+            let mut relist = false;
+            let mut pending_event = None;
+            let mut machines_at = Instant::now();
             loop {
                 let Ok((core, generation)) = this.update(cx, |this, _| {
                     (this.core.clone(), this.core_generation)
@@ -637,7 +652,9 @@ impl AppWindow {
                         event_lines = crate::hc::EventLines::new(&snapshot);
                         (channel, events)
                     });
-                    (tick, relist) = (0, true);
+                    relist = true;
+                    pending_event = None;
+                    machines_at = Instant::now();
                     if this.update_in(cx, |this, window, cx| {
                         if generation != this.core_generation { return; }
                         this.documents.entry(String::new()).or_default().connection(true, None, None);
@@ -645,9 +662,10 @@ impl AppWindow {
                         this.sync(window, cx);
                     }).is_err() { break; }
                 }
-                let ask_machines = tick.is_multiple_of(5);
-                tick += 1;
+                let ask_machines = Instant::now() >= machines_at;
+                if ask_machines { machines_at = Instant::now() + Duration::from_millis(2500); }
                 let relisting = std::mem::take(&mut relist);
+                let mut first = pending_event.take();
                 let (sub, machines, refresh, listed, lines) = cx.background_executor().spawn(async move {
                     // The local stream forwards remote doc events too.
                     let mut sub = subscription;
@@ -659,7 +677,7 @@ impl AppWindow {
                     }
                     let mut closed = false;
                     if let Some((channel, events)) = &sub {
-                        while let Ok(event) = events.try_recv() {
+                        while let Some(event) = first.take().or_else(|| events.try_recv().ok()) {
                             if let crate::hc::Stream::Data(bytes) = event {
                                 let pushed = event_lines.push(&bytes);
                                 refresh |= pushed.docs;
@@ -695,10 +713,14 @@ impl AppWindow {
                         None => this.tend_terminals(false, window, cx),
                     }
                     if changed { this.sync(window, cx); }
-                    this.fit_hidden_tabs(window, cx);
+
                     this.flush_documents(refresh, window, cx);
                 }).is_err() { break; }
-                cx.background_executor().timer(Duration::from_millis(500)).await;
+                let processed_at = Instant::now();
+                pending_event = next_core_event(subscription.as_ref().map(|(_, events)| events), cx.background_executor().timer(machines_at.saturating_duration_since(Instant::now()))).await;
+                if pending_event.is_some() {
+                    cx.background_executor().timer(Duration::from_millis(500).saturating_sub(processed_at.elapsed())).await;
+                }
             }
         }));
         w._tasks.push(cx.spawn_in(window, async move |this, cx| {
@@ -3790,6 +3812,7 @@ impl AppWindow {
     // ---- mods on disk ----------------------------------------------------
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.fit_hidden_tabs(window, cx);
         self.flush_documents(false, window, cx);
         let ready = Self::update_label();
         if ready != self.update_ready {
@@ -4937,6 +4960,21 @@ fn changed_asset_paths(home: &std::path::Path, changed: &[std::path::PathBuf]) -
 mod tests {
     use gpui::{div, point, px, size, Context, IntoElement, Render, TestAppContext, Window};
     use gpui::prelude::*;
+
+    #[test]
+    fn core_events_wake_immediately_or_wait_for_the_fallback() {
+        use std::future::Future;
+        let (tx, rx) = async_channel::unbounded();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        {
+            let mut wait = std::pin::pin!(super::next_core_event(Some(&rx), std::future::pending()));
+            assert!(wait.as_mut().poll(&mut cx).is_pending());
+            tx.try_send(crate::hc::Stream::Data(vec![1])).unwrap();
+            assert!(matches!(wait.as_mut().poll(&mut cx), std::task::Poll::Ready(Some(crate::hc::Stream::Data(_)))));
+        }
+        let mut timeout = std::pin::pin!(super::next_core_event(Some(&rx), std::future::ready(())));
+        assert!(matches!(timeout.as_mut().poll(&mut cx), std::task::Poll::Ready(None)));
+    }
 
     #[test]
     fn going_back_into_a_split_column_takes_its_top_pane_whatever_the_fractions() {
