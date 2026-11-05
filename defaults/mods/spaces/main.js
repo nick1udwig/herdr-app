@@ -227,13 +227,15 @@ export default class Spaces extends View {
     this.checked[key] = Date.now();
     this.unsure.delete(key);
     try {
-      const paths = await exec("git", ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], { cwd, on });
+      const paths = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
       if (paths.code !== 0) {
         if (!/not a git repository/i.test(paths.stderr)) this.unsure.add(key);
         this.git[key] = null;
         return;
       }
-      const [top, repo] = paths.stdout.trim().split("\n");
+      const common = await exec("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd, on });
+      if (common.code !== 0) throw new Error(common.stderr);
+      const top = paths.stdout.trim(), repo = common.stdout.trim();
       const branch = await exec("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], { cwd, on });
       const counts = await exec("git", ["rev-list", "--left-right", "--count", "HEAD...@{upstream}"], { cwd, on });
       const [ahead, behind] = counts.code === 0 ? counts.stdout.trim().split(/\s+/).map(Number) : [0, 0];

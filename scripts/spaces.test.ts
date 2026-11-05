@@ -328,7 +328,7 @@ test("branch metadata handles unborn and detached HEAD without scanning files", 
     const calls: string[][] = [];
     const exec = async (_: string, args: string[]) => {
       calls.push(args);
-      if (args[0] === "rev-parse") return { code: 0, stdout: "/repo\n/repo/.git\n" };
+      if (args[0] === "rev-parse") return { code: 0, stdout: args.includes("--git-common-dir") ? "/repo\nname/.git\r\n" : "/repo\nname\r\n" };
       if (args[0] === "symbolic-ref") return { code: detached ? 1 : 0, stdout: detached ? "" : "main\n" };
       return { code: 128, stdout: "" };
     };
@@ -339,6 +339,8 @@ test("branch metadata handles unborn and detached HEAD without scanning files", 
     await view.check(key, {});
     expect(view.git[key].branch).toBe(detached ? null : "main");
     expect(view.git[key].ahead).toBe(0);
+    expect(view.git[key].linked).toBe(false);
+    expect(JSON.parse(view.git[key].repo)[1]).toBe("/repo\nname/.git");
     expect(calls.some(a => a.includes("status"))).toBe(false);
   }
 });
