@@ -82,9 +82,11 @@ struct Grid {
     thumb: Option<Bounds<Pixels>>,
     track: Option<Bounds<Pixels>>,
     /// Row identity keeps drawing operations valid when scrolling moves a row.
-    painted: HashMap<*const Vec<vt::Cell>, (Rc<Vec<vt::Cell>>, Vec<RowOp>, Option<usize>)>,
+    painted: HashMap<*const Vec<vt::Cell>, (Rc<Vec<vt::Cell>>, Rc<Vec<RowOp>>, Option<usize>)>,
     /// Font size, cell size, font, loaded fonts and ligature setting used to draw.
     painted_with: (u32, Size<Pixels>, String, u64, bool),
+    foregrounds: HashMap<*const Vec<vt::Cell>, (Rc<Vec<vt::Cell>>, Entity<RowForeground>, Option<usize>)>,
+    foregrounds_with: Option<(u32, Size<Pixels>, String, u64, bool)>,
 }
 
 pub struct TerminalView {
@@ -250,6 +252,8 @@ impl TerminalView {
                 cursor_at: None,
                 thumb: None,
                 track: None,
+                foregrounds: HashMap::new(),
+                foregrounds_with: None,
                 painted: HashMap::new(),
                 painted_with: (0, Size::default(), String::new(), 0, false),
             })),
@@ -1526,6 +1530,69 @@ fn row_ops(row: &[vt::Cell], cell: Size<Pixels>, cursor: Option<usize>, window: 
     ops
 }
 
+struct RowForeground {
+    ops: Rc<Vec<RowOp>>,
+    cell: Size<Pixels>,
+}
+
+impl Render for RowForeground {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let (ops, cell) = (self.ops.clone(), self.cell);
+        canvas(|_, _, _| {}, move |bounds, _, window, cx| {
+            paint_foreground(&ops, bounds.origin, cell, bounds, window, cx);
+        }).size_full()
+    }
+}
+
+fn paint_foreground(ops: &[RowOp], origin: Point<Pixels>, cell: Size<Pixels>, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
+    for op in ops {
+        match op {
+            RowOp::Text { x, line } => window.paint_flat_layer(bounds, |window| {
+                let _ = line.paint(origin + point(cell.width * *x as f32, px(0.)), cell.height, TextAlign::Left, None, window, cx);
+            }),
+            RowOp::Sprite { x, text, color } => crate::sprites::paint(text, Bounds::new(origin + point(cell.width * *x as f32, px(0.)), cell), *color, window),
+            RowOp::Icon { x, offset, font, glyph, size, color } => {
+                let _ = window.paint_glyph(origin + point(cell.width * *x as f32, px(0.)) + *offset, *font, *glyph, *size, *color);
+            }
+            RowOp::Bg { .. } => {}
+        }
+    }
+}
+
+fn prepare_foregrounds(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, window: &mut Window, cx: &mut App) -> Vec<AnyElement> {
+    let mut g = grid.borrow_mut();
+    let cell = g.cell;
+    let frame = g.vt.frame();
+    let ligatures = crate::settings::get().font_ligatures;
+    let with = (crate::settings::font_size().to_bits(), cell, crate::settings::terminal_font(), crate::settings::fonts_added(), ligatures);
+    let mut previous = std::mem::take(&mut g.foregrounds);
+    if g.foregrounds_with.as_ref() != Some(&with) { previous.clear(); }
+    g.foregrounds_with = Some(with.clone());
+    if g.painted_with != with { g.painted.clear(); }
+    g.painted_with = with;
+    let (pad_x, pad_y) = pad();
+    let spare = (f32::from(bounds.size.height) - 2.0 * pad_y - f32::from(cell.height) * g.vt.rows as f32).max(0.0);
+    let scale = window.scale_factor();
+    let origin = (bounds.origin + point(px(pad_x), px(pad_y + (spare / 2.0).floor()))).map(|v| px((f32::from(v) * scale).round() / scale));
+    let mut elements = Vec::new();
+    for (y, row) in frame.rows.iter().enumerate() {
+        let column = frame.cursor_cell.filter(|(_, cy)| ligatures && *cy as usize == y).map(|(x, _)| x as usize);
+        let key = Rc::as_ptr(row);
+        let entry = previous.remove(&key).filter(|(_, _, c)| *c == column).unwrap_or_else(|| {
+            let ops = g.painted.get(&key).filter(|(_, _, c)| *c == column).map(|(_, ops, _)| ops.clone())
+                .unwrap_or_else(|| Rc::new(row_ops(row, cell, column, window)));
+            g.painted.insert(key, (row.clone(), ops.clone(), column));
+            (row.clone(), cx.new(|_| RowForeground { ops, cell }), column)
+        });
+        let mut element = entry.1.clone().cached(StyleRefinement::default().w(bounds.size.width).h(cell.height)).into_any_element();
+        element.layout_as_root(size(AvailableSpace::Definite(bounds.size.width), AvailableSpace::Definite(cell.height)), window, cx);
+        element.prepaint_at(origin + point(px(0.), cell.height * y as f32), window, cx);
+        g.foregrounds.insert(key, entry);
+        elements.push(element);
+    }
+    elements
+}
+
 /// The find field's editor colors, following the theme at open time.
 fn find_input_style() -> InputEditorStyle {
     InputEditorStyle {
@@ -1539,7 +1606,7 @@ fn find_input_style() -> InputEditorStyle {
     }
 }
 
-fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, window: &mut Window, cx: &mut App) {
+fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, mut foregrounds: Option<&mut Vec<AnyElement>>, window: &mut Window, cx: &mut App) {
     crate::bench::count(&crate::bench::GRID);
     let mut g = grid.borrow_mut();
     let cell = g.cell;
@@ -1612,7 +1679,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         let column = cursor.filter(|(_, cy)| *cy as usize == y).map(|(x, _)| x as usize);
         let key = Rc::as_ptr(row);
         let cached = previous.remove(&key).filter(|(_, _, c)| *c == column)
-            .unwrap_or_else(|| (row.clone(), row_ops(row, cell, column, window), column));
+            .unwrap_or_else(|| (row.clone(), Rc::new(row_ops(row, cell, column, window)), column));
         painted.entry(key).or_insert(cached);
     }
 
@@ -1622,7 +1689,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         // cached RowOps or the terminal's own selection/copy state.
         for (y, row) in frame.rows.iter().enumerate() {
             let ops = &painted[&Rc::as_ptr(row)].1;
-            for op in ops {
+            for op in ops.iter() {
                 match op {
                     RowOp::Bg { from, to, color } => {
                         let b = Bounds::new(at(*from, y), size(cell.width * (to - from) as f32, cell.height));
@@ -1649,28 +1716,11 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
         }
     });
 
-    // Consecutive text runs share a draw order to skip the bounds tree.
-    // Sprites and icons can extend into adjacent cells, so paint them separately.
-    let mut foreground = frame.rows.iter().enumerate()
-        .flat_map(|(y, row)| painted[&Rc::as_ptr(row)].1.iter().map(move |op| (y, op)))
-        .filter(|(_, op)| !matches!(op, RowOp::Bg { .. }))
-        .peekable();
-    while let Some(&(y, op)) = foreground.peek() {
-        match op {
-            RowOp::Text { .. } => window.paint_flat_layer(bounds, |window| {
-                while let Some((y, RowOp::Text { x, line })) = foreground.next_if(|(_, op)| matches!(op, RowOp::Text { .. })) {
-                    let _ = line.paint(at(*x, y), cell.height, TextAlign::Left, None, window, cx);
-                }
-            }),
-            RowOp::Sprite { x, text, color } => {
-                foreground.next();
-                crate::sprites::paint(text, Bounds::new(at(*x, y), cell), *color, window);
-            }
-            RowOp::Icon { x, offset, font, glyph, size, color } => {
-                foreground.next();
-                let _ = window.paint_glyph(at(*x, y) + *offset, *font, *glyph, *size, *color);
-            }
-            RowOp::Bg { .. } => unreachable!(),
+    if let Some(rows) = foregrounds.as_mut() {
+        for row in rows.iter_mut() { row.paint(window, cx); }
+    } else {
+        for (y, row) in frame.rows.iter().enumerate() {
+            paint_foreground(&painted[&Rc::as_ptr(row)].1, at(0, y), cell, bounds, window, cx);
         }
     }
     {
@@ -1988,12 +2038,13 @@ impl Render for TerminalView {
             }))
             .child(
                 canvas(
-                    move |bounds, window, _cx| {
+                    move |bounds, window, cx| {
                         let (cols, rows) = grid_size(bounds.size, cell);
                         grid.borrow_mut().fit(cols, rows, cell, window.scale_factor());
+                        prepare_foregrounds(bounds, &grid, window, cx)
                     },
-                    move |bounds, _, window, cx| {
-                        paint_grid(bounds, &grid_paint, focused, window, cx);
+                    move |bounds, mut rows, window, cx| {
+                        paint_grid(bounds, &grid_paint, focused, Some(&mut rows), window, cx);
                         let view = selection_view.clone();
                         window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture {
@@ -2160,6 +2211,39 @@ impl Focusable for TerminalView {
 mod tests {
     use super::{ScrollTarget, pages_to_lines, scroll_target};
     use serde_json::{Value, json};
+
+    #[gpui::test]
+    fn foreground_rows_survive_updates_to_other_rows(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+        struct Root(Entity<super::TerminalView>);
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.0.clone())
+            }
+        }
+        let (root, cx) = cx.add_window_view(|_, cx| Root(cx.new(|cx| {
+            let terminal = super::TerminalView::attach(crate::hc::offline(), "t1".into(), (40, 5), cx);
+            terminal.grid.borrow_mut().vt.write(b"stable\r\nworking");
+            terminal
+        })));
+        cx.run_until_parked();
+        let rows = |cx: &mut VisualTestContext| root.read_with(cx, |root, cx| {
+            root.0.read(cx).grid.borrow().foregrounds.values()
+                .map(|(row, view, _)| (row.iter().map(|c| c.text.as_str()).collect::<String>().trim().to_owned(), view.entity_id()))
+                .collect::<std::collections::HashMap<_, _>>()
+        });
+        let before = rows(cx);
+        root.update(cx, |root, cx| root.0.update(cx, |terminal, cx| {
+            terminal.grid.borrow_mut().vt.write(b"\x1b[2;1Hchanged");
+            cx.notify();
+        }));
+        cx.run_until_parked();
+        let after = rows(cx);
+        assert_eq!(before.get("stable"), after.get("stable"));
+        assert!(after.contains_key("stable"));
+        assert_ne!(before.get("working"), after.get("changed"));
+        assert!(after.contains_key("changed"));
+    }
 
     #[test]
     fn visible_output_batches_except_for_immediate_keyboard_echo() {
@@ -2876,7 +2960,7 @@ mod tests {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 let grid = self.grid.clone();
                 canvas(|_, _, _| {}, move |bounds, _, window, cx| {
-                    paint_grid(bounds, &grid, false, window, cx);
+                    paint_grid(bounds, &grid, false, None, window, cx);
                 }).size_full()
             }
         }
