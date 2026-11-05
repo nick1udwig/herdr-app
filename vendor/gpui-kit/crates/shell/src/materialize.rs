@@ -2889,7 +2889,10 @@ pub(crate) fn spin_layer(view: gpui::EntityId) -> AnyElement {
             }
             let scale = window.scale_factor();
             let turning = crate::value::spinners();
+            let mut visible = false;
             for s in spins {
+                if s.color.a == 0.0 || s.bounds.intersect(&s.mask.bounds).is_empty() { continue; }
+                visible = true;
                 let turn = if turning { (loop_clock_ms() % s.ms) / s.ms } else { 0.0 };
                 let center = s.bounds.center();
                 let matrix = gpui::TransformationMatrix::unit()
@@ -2900,7 +2903,7 @@ pub(crate) fn spin_layer(view: gpui::EntityId) -> AnyElement {
                     let _ = window.paint_svg(s.bounds, s.path, None, matrix, s.color, cx);
                 });
             }
-            if turning {
+            if turning && visible {
                 wake_view_after(Duration::from_millis(100), window, cx);
             }
         },
