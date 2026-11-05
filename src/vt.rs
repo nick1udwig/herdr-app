@@ -72,7 +72,7 @@ pub fn theme() -> Theme {
     Theme { fg: get("terminal_foreground"), bg: get("background"), cursor: get("cursor"), selection_bg: get("selection"), palette16, minimum_contrast: crate::settings::get().minimum_contrast }
 }
 
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Cell {
     /// Empty for blank cells and for the tail half of a wide character.
     pub text: String,
@@ -500,6 +500,7 @@ pub struct Vt {
     /// them don't mark the render state dirty.
     drawn: (CursorKey, u64, u64),
     drawn_rows: Vec<Rc<Vec<Cell>>>,
+    pending_frame: Option<Frame>,
     /// The rows read last frame by libghostty's row id, with their selection:
     /// one that isn't dirty is the same row and isn't read again.
     seen: HashMap<[u64; 2], (Rc<Vec<Cell>>, Option<(u16, u16)>)>,
@@ -736,6 +737,7 @@ impl Vt {
                 release,
                 drawn: Default::default(),
                 drawn_rows: Vec::new(),
+                pending_frame: None,
                 seen: HashMap::new(),
                 seen_with: (0, 0),
                 placements_cache: RefCell::new(None),
@@ -749,6 +751,7 @@ impl Vt {
     /// Switches colors live (settings.json changed).
     pub fn set_theme(&mut self, theme: Theme) {
         if self.theme != theme {
+            self.pending_frame = None;
             self.theme = theme;
             self.apply_theme();
             // Rows carry the theme's own colors too (the selection's).
@@ -958,6 +961,7 @@ impl Vt {
     /// Feeds one mouse step of a selection gesture (cell + pixel position in the grid).
     /// Applies the resulting selection; a plain click clears it.
     pub fn select(&mut self, step: Select, col: u16, row: u16, x: f32, y: f32, cell_w: f32, height: f32) {
+        self.pending_frame = None;
         unsafe {
             let mut r = GhosttyGridRef { size: std::mem::size_of::<GhosttyGridRef>(), ..Default::default() };
             let mut p = GhosttyPoint { tag: GHOSTTY_POINT_TAG_VIEWPORT, ..Default::default() };
@@ -1213,10 +1217,12 @@ impl Vt {
     }
 
     pub fn clear_selection(&mut self) {
+        self.pending_frame = None;
         unsafe { ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, std::ptr::null()) };
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
+        self.pending_frame = None;
         self.placements_cache.get_mut().take();
         self.win32.watch(bytes);
         unsafe { ghostty_terminal_vt_write(self.term, bytes.as_ptr(), bytes.len()) };
@@ -1232,6 +1238,7 @@ impl Vt {
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16, cell_w: u32, cell_h: u32) {
+        self.pending_frame = None;
         if cols == 0 || rows == 0 {
             return;
         }
@@ -1285,6 +1292,7 @@ impl Vt {
     }
 
     pub fn scroll_viewport(&mut self, delta: isize) {
+        self.pending_frame = None;
         self.placements_cache.get_mut().take();
         let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_DELTA, ..Default::default() };
         s.value.delta = delta;
@@ -1294,6 +1302,7 @@ impl Vt {
 
     /// Scrolls so `row` (from the scrollback's top) is the first visible row.
     pub fn scroll_to_row(&mut self, row: usize) {
+        self.pending_frame = None;
         self.placements_cache.get_mut().take();
         let mut s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_ROW, ..Default::default() };
         s.value.row = row;
@@ -1310,6 +1319,7 @@ impl Vt {
     }
 
     pub fn scroll_to_bottom(&mut self) {
+        self.pending_frame = None;
         self.placements_cache.get_mut().take();
         let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_BOTTOM, ..Default::default() };
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
@@ -1332,6 +1342,7 @@ impl Vt {
     }
 
     pub fn set_search_needle(&mut self, needle: &str) {
+        self.pending_frame = None;
         let Some(search) = self.search else { return };
         self.search_active = !needle.is_empty();
         let value = GhosttyString { ptr: needle.as_ptr(), len: needle.len() };
@@ -1360,6 +1371,7 @@ impl Vt {
     /// Make one bounded unit of progress. Interactive searches must not call
     /// Ghostty's blocking `run` on the UI thread.
     pub fn progress_search(&mut self) -> bool {
+        self.pending_frame = None;
         let Some(search) = self.search.filter(|_| self.search_active) else { return false };
         let before = (self.search_progress, self.search_spans.clone());
         let mut status = GHOSTTY_SEARCH_STATUS_COMPLETE;
@@ -1377,6 +1389,7 @@ impl Vt {
     /// Navigate only after incremental indexing is complete; the Ghostty
     /// select API catches up synchronously, so calling it early could stall UI.
     pub fn search_navigate(&mut self, previous: bool) -> bool {
+        self.pending_frame = None;
         let Some(search) = self.search.filter(|_| self.search_active && self.search_progress.complete) else { return false };
         let option = if previous { GHOSTTY_SEARCH_OPT_SELECT_PREV } else { GHOSTTY_SEARCH_OPT_SELECT_NEXT };
         if unsafe { ghostty_search_set(search, option, std::ptr::null()) } != GHOSTTY_SUCCESS {
@@ -1475,6 +1488,7 @@ impl Vt {
     }
 
     pub fn scroll_to_top(&mut self) {
+        self.pending_frame = None;
         self.placements_cache.get_mut().take();
         let s = GhosttyTerminalScrollViewport { tag: GHOSTTY_SCROLL_VIEWPORT_TOP, ..Default::default() };
         unsafe { ghostty_terminal_scroll_viewport(self.term, s) };
@@ -1497,8 +1511,10 @@ impl Vt {
         if self.shared.held_since.is_some() {
             return true;
         }
-        let frame = self.read_frame();
-        frame.rows != self.drawn_rows || unsafe { self.drawable() } != self.drawn
+        let frame = self.pending_frame.take().unwrap_or_else(|| self.read_frame());
+        let changed = frame.rows != self.drawn_rows || unsafe { self.drawable() } != self.drawn;
+        self.pending_frame = Some(frame);
+        changed
     }
 
     /// The cursor and the colors (from the updated render state), and the kitty
@@ -1527,7 +1543,7 @@ impl Vt {
 
     /// Updates the render state (respecting synchronized output) and reads one frame.
     pub fn frame(&mut self) -> Frame {
-        let frame = self.read_frame();
+        let frame = self.pending_frame.take().unwrap_or_else(|| self.read_frame());
         self.drawn_rows = frame.rows.clone();
         self.drawn = unsafe { self.drawable() };
         frame
@@ -1939,6 +1955,30 @@ mod tests {
         assert_eq!(f.rows[1][2].text, "!");
         let c = f.cursor.unwrap();
         assert_eq!((c.x, c.y), (3, 1));
+    }
+
+    #[test]
+    fn checked_frames_are_reused_and_invalidated_by_visual_changes() {
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"hello");
+        assert!(vt.shows_change());
+        let rows = vt.pending_frame.as_ref().unwrap().rows.as_ptr();
+        assert_eq!(vt.frame().rows.as_ptr(), rows);
+        assert!(!vt.shows_change());
+        vt.write(b" world");
+        assert!(vt.shows_change());
+        assert_eq!(vt.frame().rows[0].iter().map(|c| c.text.as_str()).collect::<String>().trim(), "hello world");
+        vt.shows_change();
+        vt.select(Select::Press, 0, 0, 1.0, 5.0, 10.0, 60.0);
+        assert!(vt.pending_frame.is_none());
+        vt.shows_change();
+        vt.resize(30, 4, 10, 20);
+        assert_eq!(vt.frame().rows.len(), 4);
+        vt.shows_change();
+        let mut theme = vt.theme.clone();
+        theme.bg = Rgb(1, 2, 3);
+        vt.set_theme(theme);
+        assert_eq!(vt.frame().bg, Rgb(1, 2, 3));
     }
 
     #[test]

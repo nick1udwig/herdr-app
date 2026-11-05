@@ -1559,7 +1559,7 @@ fn paint_foreground(ops: &[RowOp], origin: Point<Pixels>, cell: Size<Pixels>, bo
     }
 }
 
-fn prepare_foregrounds(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, window: &mut Window, cx: &mut App) -> Vec<AnyElement> {
+fn prepare_foregrounds(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, window: &mut Window, cx: &mut App) -> (vt::Frame, Vec<AnyElement>) {
     let mut g = grid.borrow_mut();
     let cell = g.cell;
     let frame = g.vt.frame();
@@ -1590,7 +1590,7 @@ fn prepare_foregrounds(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, window:
         g.foregrounds.insert(key, entry);
         elements.push(element);
     }
-    elements
+    (frame, elements)
 }
 
 /// The find field's editor colors, following the theme at open time.
@@ -1606,7 +1606,7 @@ fn find_input_style() -> InputEditorStyle {
     }
 }
 
-fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, mut foregrounds: Option<&mut Vec<AnyElement>>, window: &mut Window, cx: &mut App) {
+fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, frame: Option<vt::Frame>, mut foregrounds: Option<&mut Vec<AnyElement>>, window: &mut Window, cx: &mut App) {
     crate::bench::count(&crate::bench::GRID);
     let mut g = grid.borrow_mut();
     let cell = g.cell;
@@ -1618,7 +1618,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, m
     let origin = bounds.origin + point(px(pad_x), px(pad_y + (spare / 2.0).floor()));
     let origin = point(snap(origin.x), snap(origin.y));
     g.origin = origin;
-    let frame = g.vt.frame();
+    let frame = frame.unwrap_or_else(|| g.vt.frame());
     let placements = g.vt.placements();
     let mut images: Vec<(bool, Bounds<Pixels>, Arc<RenderImage>)> = Vec::new();
     let mut keep = std::collections::HashSet::new();
@@ -2043,8 +2043,8 @@ impl Render for TerminalView {
                         grid.borrow_mut().fit(cols, rows, cell, window.scale_factor());
                         prepare_foregrounds(bounds, &grid, window, cx)
                     },
-                    move |bounds, mut rows, window, cx| {
-                        paint_grid(bounds, &grid_paint, focused, Some(&mut rows), window, cx);
+                    move |bounds, (frame, mut rows), window, cx| {
+                        paint_grid(bounds, &grid_paint, focused, Some(frame), Some(&mut rows), window, cx);
                         let view = selection_view.clone();
                         window.on_mouse_event(move |ev: &MouseMoveEvent, phase, _, cx| {
                             if phase == DispatchPhase::Capture {
@@ -2960,7 +2960,7 @@ mod tests {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 let grid = self.grid.clone();
                 canvas(|_, _, _| {}, move |bounds, _, window, cx| {
-                    paint_grid(bounds, &grid, false, None, window, cx);
+                    paint_grid(bounds, &grid, false, None, None, window, cx);
                 }).size_full()
             }
         }
