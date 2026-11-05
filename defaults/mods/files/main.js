@@ -43,7 +43,7 @@ export default class Files extends View {
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
     this.refresh(cx);
-    cx.timer.every(10000, cx => this.refresh(cx));
+    cx.timer.every(10000, cx => this.invalidate(cx));
   }
 
   watch(root, cx) {
@@ -51,7 +51,7 @@ export default class Files extends View {
     this.watched = root;
     const context = this.context;
     cx.spawn(async cx => {
-      try { while (this.context === context) { await watchFolder(root); if (this.current(context)) this.refresh(cx); } }
+      try { while (this.context === context) { const paths = await watchFolder(root); if (this.current(context)) this.invalidate(cx, paths); } }
       catch { if (this.context === context) this.watched = null; }
     });
   }
@@ -69,9 +69,17 @@ export default class Files extends View {
     if (entries.length > PER_FOLDER || used + entries.length > TOTAL) this.limited = true;
   }
 
-  refresh(cx) {
+  invalidate(cx, paths) {
+    this.refreshPaths = paths && (!this.refreshPending || this.refreshPaths) ? [...new Set([...(this.refreshPaths ?? []), ...paths])] : null;
+    this.refreshPending = true;
+    cx.notify();
+  }
+
+  refresh(cx, paths) {
+    if (paths?.some(path => path.includes("\\"))) paths = null;
     const { cwd, on } = location(), next = key();
     if (next !== this.context?.key) {
+      paths = null;
       if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file });
       const saved = this.saved.get(next);
       this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
@@ -87,7 +95,8 @@ export default class Files extends View {
       try {
         for (const path of ["", ...this.folders]) {
           if (!this.current(context)) return;
-          await this.loadFolder(path, context);
+          const directory = path ? `${cwd}/${path}` : cwd;
+          if (!paths || paths.some(changed => changed === cwd || changed === directory || directory.startsWith(changed + "/") || changed.slice(0, changed.lastIndexOf("/")) === directory)) await this.loadFolder(path, context);
         }
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
         const marks = {};
@@ -164,6 +173,10 @@ export default class Files extends View {
   }
 
   render(cx) {
+    if (this.refreshPending && !this.loading && !this.busy) {
+      this.refreshPending = false;
+      this.refresh(cx, this.refreshPaths);
+    }
     if (key() !== this.context?.key) this.refresh(cx);
     const t = theme();
     return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)

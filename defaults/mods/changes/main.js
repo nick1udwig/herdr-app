@@ -41,7 +41,7 @@ export default class Changes extends View {
     this.input.on("focus", (_e, cx) => { this.typing = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
     this.refresh(cx);
-    cx.timer.every(10000, (cx) => this.refresh(cx));
+    cx.timer.every(10000, (cx) => this.invalidate(cx));
   }
 
   watch(root, cx) {
@@ -50,17 +50,25 @@ export default class Changes extends View {
     cx.spawn(async (cx) => {
       try {
         while (this.watched === root) {
-          await watchFolder(root);
-          if (this.watched === root) this.refresh(cx);
+          const paths = await watchFolder(root);
+          if (this.watched === root) this.invalidate(cx, paths);
         }
       } catch { this.watched = null; }
     });
   }
 
-  refresh(cx) {
+  invalidate(cx, paths) {
+    this.refreshPaths = paths && (!this.refreshPending || this.refreshPaths) ? [...new Set([...(this.refreshPaths ?? []), ...paths])] : null;
+    this.refreshPending = true;
+    cx.notify();
+  }
+
+  refresh(cx, paths) {
+    if (paths?.some(path => path.includes("\\"))) paths = null;
     if (this.loading || this.busy) return;
     const { cwd, on } = location(), context = key();
     if (context !== this.context) {
+      paths = null;
       this.context = context; this.root = null; this.files = []; this.open = null;
       this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.closed = false; this.limited = false;
     }
@@ -101,7 +109,7 @@ export default class Changes extends View {
         if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.setLines([]); }
         // The first file's diff shows until you pick another.
         if (!this.open && !this.closed && files.length) this.open = files[0].path;
-        if (this.open) {
+        if (this.open && (!paths || !this.rows.length || paths.some(path => path === root || path === `${root}/${this.open}` || path.includes("/.git/")))) {
           try { await this.load(this.open, context); }
           catch { if (key() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
         }
@@ -173,6 +181,10 @@ export default class Changes extends View {
   }
 
   render(cx) {
+    if (this.refreshPending && !this.loading && !this.busy) {
+      this.refreshPending = false;
+      this.refresh(cx, this.refreshPaths);
+    }
     if (key() !== this.context) this.refresh(cx);
     const t = theme(), add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
     const enabled = Boolean(this.message.trim() && this.root && !this.busy && !this.loading);
