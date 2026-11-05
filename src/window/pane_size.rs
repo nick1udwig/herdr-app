@@ -166,6 +166,23 @@ impl AppWindow {
     /// after the window changed size draws its old screens, then jumps once the programs
     /// redraw. Once the window settles (the same at two ticks), they are sized as their
     /// panes would be, so the programs redraw out of sight.
+    pub(super) fn schedule_hidden_fit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((_, area)) = self.context_area() else { return };
+        let geometry = (area, crate::terminal::cell_size(window));
+        if matches!(self.hidden_fit, HiddenFit::Done(g) if g == geometry) || self.hidden_fit_task.is_some() { return; }
+        self.hidden_fit_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_millis(400)).await;
+                let again = this.update_in(cx, |this, window, cx| {
+                    this.fit_hidden_tabs(window, cx);
+                    if matches!(this.hidden_fit, HiddenFit::Seen(_)) { true }
+                    else { this.hidden_fit_task = None; false }
+                });
+                if !matches!(again, Ok(true)) { break; }
+            }
+        }));
+    }
+
     pub(super) fn fit_hidden_tabs(&mut self, window: &Window, cx: &App) {
         let Some((_, area)) = self.context_area() else { return };
         let cell = crate::terminal::cell_size(window);

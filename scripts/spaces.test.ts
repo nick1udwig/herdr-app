@@ -36,7 +36,7 @@ function harness(replies: unknown[] = [], storage = new Map<string, string>(), s
   view.reconnecting = {};
   view.folded = new Set(["cloud"]);
   view.refreshMachines = () => {};
-  const cx = { timer: { every() {} }, notify() {}, spawn(fn: (cx: unknown) => Promise<unknown>) { tasks.push(fn(cx)); } };
+  const cx = { timer: { every() {}, after() { return { cancel() {} }; } }, notify() {}, spawn(fn: (cx: unknown) => Promise<unknown>) { tasks.push(fn(cx)); } };
   return { view, calls, tasks, cx, storage, moves, handlers, snapshot, availability, reads };
 }
 
@@ -341,4 +341,32 @@ test("branch metadata handles unborn and detached HEAD without scanning files", 
     expect(view.git[key].ahead).toBe(0);
     expect(calls.some(a => a.includes("status"))).toBe(false);
   }
+});
+
+test("the sidebar sleeps until its next useful deadline", () => {
+  const now = spyOn(Date, "now").mockReturnValue(10000);
+  try {
+    const h = harness();
+    const delays: number[] = [];
+    let callback: Function = () => {};
+    h.cx.timer.after = (delay: number, fn: Function) => { delays.push(delay); callback = fn; return { cancel() {} }; };
+    h.view.init({}, h.cx);
+    h.view.due = () => new Set();
+    now.mockReturnValue(10100);
+    h.view.scheduleCheck(h.cx, 250);
+    expect(delays).toEqual([250]);
+    now.mockReturnValue(10250);
+    callback(h.cx);
+    expect(delays).toEqual([250, 60000]);
+  } finally { now.mockRestore(); }
+});
+
+test("unchanged machine results do not redraw the sidebar", async () => {
+  const h = harness([{ code: 0, stdout: '{"machines":[]}' }]);
+  h.view.machines = [];
+  let notified = 0;
+  h.cx.notify = () => { notified++; };
+  Object.getPrototypeOf(h.view).refreshMachines.call(h.view, h.cx);
+  await Promise.all(h.tasks);
+  expect(notified).toBe(0);
 });

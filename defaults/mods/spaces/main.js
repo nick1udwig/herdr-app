@@ -71,9 +71,23 @@ export default class Spaces extends View {
     cx.timer.every(15000, cx => this.refreshMachines(cx));
     // `git status` walks the whole tree, on another machine a process there:
     // only when its answer could have changed (see `due`).
-    cx.timer.every(250, (cx) => this.checkNew(cx));
+    this.checkTimer = null;
     this.checkDue = true;
     this.nextCheck = 0;
+    this.scheduleCheck(cx, 250);
+  }
+
+  scheduleCheck(cx, delay) {
+    if (!cx.timer) return;
+    const at = Date.now() + delay;
+    if (this.checkTimer && this.checkAt <= at) return;
+    this.checkTimer?.cancel();
+    this.checkAt = at;
+    this.checkTimer = cx.timer.after(delay, cx => {
+      this.checkTimer = null;
+      this.checkNew(cx);
+      this.scheduleCheck(cx, Math.max(1, this.nextCheck - Date.now()));
+    });
   }
 
   checkNew(cx) {
@@ -133,8 +147,12 @@ export default class Spaces extends View {
 
   refreshMachines(cx) {
     cx.spawn(async cx => {
-      try { const r = await hc(["machine", "ls", "--json"]); if (r.code === 0) this.machines = (JSON.parse(r.stdout).machines ?? []).filter((m) => !m.temporary); } catch {}
-      cx.notify();
+      try {
+        const r = await hc(["machine", "ls", "--json"]);
+        if (r.code !== 0) return;
+        const next = (JSON.parse(r.stdout).machines ?? []).filter(m => !m.temporary);
+        if (JSON.stringify(next) !== JSON.stringify(this.machines)) { this.machines = next; cx.notify(); }
+      } catch {}
     });
   }
 
@@ -447,8 +465,9 @@ export default class Spaces extends View {
       .child(div().absolute().right(5).text_color(tone(t, w.status)).child(glyph(w.status))));
   }
 
-  render() {
+  render(cx) {
     this.checkDue = true;
+    this.scheduleCheck(cx, 250);
     const t = theme();
     const collapsed = narrow();
     const palette = ["ansi6", "ansi3", "ansi4", "ansi5", "ansi2", "ansi1"];

@@ -456,7 +456,8 @@ pub struct AppWindow {
     system_dark: bool,
     /// The OS tells us when files change (`files.rs`); else the disk is polled.
     file_events: Option<async_channel::Receiver<crate::files::Changed>>,
-    polls: u64,
+    maintenance_at: Instant,
+    hidden_fit_task: Option<Task<()>>,
     /// The downloaded update the frame's pill offers, and the one closed for now.
     /// What's waiting, in words (`update_label`).
     update_ready: Option<String>,
@@ -545,7 +546,8 @@ impl AppWindow {
             window_active: true,
             system_dark: is_dark(window.appearance()),
             file_events: crate::files::watch(&mods::app_dir()),
-            polls: 0,
+            maintenance_at: Instant::now(),
+            hidden_fit_task: None,
             update_ready: None,
             update_dismissed: None,
             update_success: false,
@@ -593,14 +595,8 @@ impl AppWindow {
             w.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
         }
 
-        w._tasks.push(cx.spawn_in(window, async move |this, cx| {
-            loop {
-                if this.update_in(cx, |this, window, cx| this.poll(window, cx)).is_err() {
-                    break;
-                }
-                cx.background_executor().timer(Duration::from_millis(400)).await;
-            }
-        }));
+        cx.observe_window_activation(window, |this, window, cx| this.poll(window, cx)).detach();
+        cx.observe_window_appearance(window, |this, window, cx| this.poll(window, cx)).detach();
         if let Some(events) = w.file_events.clone() {
             w._tasks.push(cx.spawn_in(window, async move |this, cx| {
                 while let Ok(mut changed) = events.recv().await {
@@ -696,7 +692,7 @@ impl AppWindow {
                 subscription = sub;
                 event_lines = lines;
                 let (seen, resynced) = event_lines.take_seen();
-                if (machines.is_some() || refresh || listed.is_some() || !watching || resynced || !seen.is_empty()) && this.update_in(cx, |this, window, cx| {
+                if (ask_machines || machines.is_some() || refresh || listed.is_some() || !watching || resynced || !seen.is_empty()) && this.update_in(cx, |this, window, cx| {
                     if generation != this.core_generation { return; }
                     // Our seen writes the core has applied (or, after a fresh
                     // snapshot, can't tell): its labels decide again.
@@ -715,6 +711,7 @@ impl AppWindow {
                     if changed { this.sync(window, cx); }
 
                     this.flush_documents(refresh, window, cx);
+                    if ask_machines { this.poll(window, cx); }
                 }).is_err() { break; }
                 let processed_at = Instant::now();
                 pending_event = next_core_event(subscription.as_ref().map(|(_, events)| events), cx.background_executor().timer(machines_at.saturating_duration_since(Instant::now()))).await;
@@ -3588,6 +3585,12 @@ impl AppWindow {
         }
         let first_term = layout.as_ref().and_then(|l| l.visible_blocks().into_iter().find(|n| matches!(n.content(), Some(Content::Terminal { .. }))).map(|n| n.id.clone()));
         let has_layout = layout.is_some();
+        if kind == OverlayKind::Toast {
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(timeout as u64)).await;
+                let _ = this.update_in(cx, |this, window, cx| this.poll(window, cx));
+            }).detach();
+        }
         self.overlays.push(Overlay {
             id,
             kind,
@@ -3830,11 +3833,12 @@ impl AppWindow {
         }
         // With file events the disk is only checked now and then, in case one
         // was missed.
-        self.polls += 1;
-        if self.polls.is_multiple_of(25) {
+        let fallback = self.maintenance_at.elapsed() >= Duration::from_secs(10);
+        if fallback {
+            self.maintenance_at = Instant::now();
             self.observe();
         }
-        if self.file_events.is_none() || self.polls.is_multiple_of(25) {
+        if self.file_events.is_none() || fallback {
             self.reload_config(window, cx);
             self.check_layout_file(window, cx);
             self.sync_folders(window, cx);
@@ -4796,6 +4800,8 @@ impl Render for AppWindow {
         let _timed = crate::bench::timed(&crate::bench::WINDOW_US);
         crate::bench::frame_start();
         crate::terminal::next_frame();
+        if let Some(runtime) = &self.runtime { crate::bench::note_mods(&runtime.read_metrics()); }
+        cx.defer_in(window, |this, window, cx| this.schedule_hidden_fit(window, cx));
         window.set_rem_size(px(settings::ui_font_size()));
         // A terminal the person clicked into becomes the focused pane.
         let clicked = self
