@@ -43,7 +43,7 @@ export default class Files extends View {
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
     this.refresh(cx);
-    cx.timer.every(10000, cx => this.invalidate(cx));
+    cx.timer.every(10000, cx => { if (!this.watched || Date.now() - (this.fullRefreshedAt ?? 0) >= 60000) this.invalidate(cx); });
   }
 
   watch(root, cx) {
@@ -90,6 +90,7 @@ export default class Files extends View {
     if (!cwd || this.loading) return;
     const context = this.context;
     this.loading = true;
+    if (!paths) this.fullRefreshedAt = Date.now();
     if (!paths) this.limited = false;
     cx.spawn(async cx => {
       try {
@@ -99,10 +100,12 @@ export default class Files extends View {
           if (!paths || paths.some(changed => changed === cwd || changed === directory || directory.startsWith(changed + "/") || changed.slice(0, changed.lastIndexOf("/")) === directory)) await this.loadFolder(path, context);
         }
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }).catch(() => null);
-        const marks = {};
+        const root = top?.code === 0 ? top.stdout.trim() : null;
+        const scope = root && paths?.length && paths.every(p => p.startsWith(root + "/") && !p.slice(root.length + 1).startsWith(".git") && !/\/(?:\.git|\.gitignore|\.gitattributes)(?:\/|$)/.test(p)) ? paths : null;
+        const marks = scope ? Object.fromEntries(Object.entries(this.marks).filter(([p]) => !scope.some(changed => p === changed || p.startsWith(changed + "/")))) : {};
         if (top?.code === 0) {
           // Writes nothing under .git (index lock, fsmonitor cookie): the folder watch would refresh again.
-          const status = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"], { cwd, on }).catch(() => null);
+          const status = await exec("git", ["--no-optional-locks", "-c", "core.fsmonitor=false", "--literal-pathspecs", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all", ...(scope ? ["--", ...scope.map(p => p.slice(root.length + 1))] : [])], { cwd: root, on }).catch(() => null);
           if (status?.code === 0) for (const entry of status.stdout.split("\0").filter(Boolean).slice(0, TOTAL)) {
             const xy = entry.slice(0, 2);
             marks[`${top.stdout.trim()}/${entry.slice(3)}`] = xy === "??" || xy.includes("A") ? "A" : xy.includes("U") ? "U" : xy.includes("D") ? "D" : "M";

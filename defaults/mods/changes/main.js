@@ -41,7 +41,7 @@ export default class Changes extends View {
     this.input.on("focus", (_e, cx) => { this.typing = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
     this.refresh(cx);
-    cx.timer.every(10000, (cx) => this.invalidate(cx));
+    cx.timer.every(10000, cx => { if (!this.watched || Date.now() - (this.fullRefreshedAt ?? 0) >= 60000) this.invalidate(cx); });
   }
 
   watch(root, cx) {
@@ -74,17 +74,22 @@ export default class Changes extends View {
     }
     if (!cwd) return;
     this.loading = true;
+    if (!paths) this.fullRefreshedAt = Date.now();
     cx.spawn(async (cx) => {
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
         if (key() !== context) return;
         if (top.code !== 0) { this.root = null; this.files = []; this.setLines([]); this.open = null; this.error = "Not a git repository"; return; }
-        const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
-        const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
+        const root = top.stdout.trim();
+        const scope = paths?.length && paths.every(p => p.startsWith(root + "/") && !p.slice(root.length + 1).startsWith(".git") && !/\/(?:\.git|\.gitignore|\.gitattributes)(?:\/|$)/.test(p)) ? paths.map(p => p.slice(root.length + 1)) : null;
+        const affects = path => !scope || scope.some(p => path === p || path.startsWith(p + "/"));
+        const git = args => exec("git", [...READ, "--literal-pathspecs", ...args], { cwd: root, on });
+        const filter = scope ? ["--", ...scope] : [];
+        const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all", ...filter]);
         if (status.code !== 0) throw new Error(status.stderr);
         const head = await git(["rev-parse", "--verify", "HEAD"]);
         const stats = {};
-        const results = head.code === 0 ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])] : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
+        const results = head.code === 0 ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames", ...filter])] : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames", ...filter]), await git(["diff", "--numstat", "-z", "--no-renames", ...filter])];
         for (const result of results) {
           if (result.code !== 0) throw new Error(result.stderr);
           for (const entry of result.stdout.split("\0")) {
@@ -94,7 +99,7 @@ export default class Changes extends View {
             stats[path] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
           }
         }
-        const files = [];
+        const files = scope ? this.files.filter(f => !affects(f.path)) : [];
         const entries = status.stdout.split("\0").filter(Boolean);
         for (const entry of entries.slice(0, 1000)) {
           const xy = entry.slice(0, 2), path = entry.slice(3), fresh = xy === "??";
@@ -104,7 +109,7 @@ export default class Changes extends View {
           files.push({ path, status: s, fresh, ...stat });
         }
         if (key() !== context) return;
-        this.root = root; this.on = on; this.hasHead = head.code === 0; this.files = files; this.limited = entries.length > 1000; this.error = null;
+        this.root = root; this.on = on; this.hasHead = head.code === 0; this.files = files.slice(0, 1000); this.limited = (scope && this.limited) || entries.length > 1000 || files.length > 1000; this.error = null;
         this.watch(root, cx);
         if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.setLines([]); }
         // The first file's diff shows until you pick another.

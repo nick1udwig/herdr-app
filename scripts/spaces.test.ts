@@ -321,3 +321,24 @@ test("new sidebar spaces keep their short discovery deadline", () => {
     expect(view.nextCheck).toBe(61250);
   } finally { clock.mockRestore(); }
 });
+
+test("branch metadata handles unborn and detached HEAD without scanning files", async () => {
+  const method = source.slice(source.indexOf("  async check(key, cx) {"), source.indexOf("  watch(repo, cx) {"));
+  for (const detached of [false, true]) {
+    const calls: string[][] = [];
+    const exec = async (_: string, args: string[]) => {
+      calls.push(args);
+      if (args[0] === "rev-parse") return { code: 0, stdout: "/repo\n/repo/.git\n" };
+      if (args[0] === "symbolic-ref") return { code: detached ? 1 : 0, stdout: detached ? "" : "main\n" };
+      return { code: 128, stdout: "" };
+    };
+    const Panel = new Function("exec", "base", `return class { ${method} }`)(exec, (s: string) => s.split("/").pop());
+    const view = new Panel();
+    view.checked = {}; view.git = {}; view.unsure = new Set(); view.watch = () => {};
+    const key = JSON.stringify([null, "/repo"]);
+    await view.check(key, {});
+    expect(view.git[key].branch).toBe(detached ? null : "main");
+    expect(view.git[key].ahead).toBe(0);
+    expect(calls.some(a => a.includes("status"))).toBe(false);
+  }
+});
