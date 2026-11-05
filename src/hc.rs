@@ -142,6 +142,12 @@ impl EventLines {
             return true;
         }
         let t = &mut self.terminals[i];
+        if kind == "title" {
+            let displayed = |v: &Value| crate::terminal::shown_title(v.as_str().unwrap_or_default()).to_owned();
+            let changed = displayed(&t["title"]) != displayed(&data["title"]);
+            t["title"] = data["title"].clone();
+            return changed;
+        }
         let mut set = |keys: &[&str]| keys.iter().for_each(|k| t[*k] = data[*k].clone());
         match kind {
             "finished" | "lost" => {
@@ -154,7 +160,6 @@ impl EventLines {
             }
             "status" => set(&["status", "records", "reported"]),
             "turn" => set(&["turn"]),
-            "title" => set(&["title"]),
             "labels" => set(&["labels"]),
             "keep" => set(&["keep"]),
             "size" => set(&["cols", "rows"]),
@@ -512,6 +517,15 @@ pub fn offline() -> Arc<Core> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cosmetic_titles_update_raw_state_without_invalidating_the_list() {
+        let mut lines = EventLines::new(&json!({"seq": 1, "terminals": [{"address": "t1", "state": "live", "title": "⠋ working"}]}));
+        let event = |seq, title| format!("{}\n", json!({"method":"event", "params":{"seq":seq, "type":"title", "terminal":"t1", "data":{"title":title}}}));
+        assert!(!lines.push(event(2, "⠙ working").as_bytes()).terminals);
+        assert_eq!(lines.live()["terminals"][0]["title"], "⠙ working");
+        assert!(lines.push(event(3, "finished").as_bytes()).terminals);
+    }
 
     #[test]
     fn the_event_stream_keeps_the_terminals_as_the_core_has_them() {

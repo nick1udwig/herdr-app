@@ -688,7 +688,7 @@ impl AppWindow {
                     }
                     // A stream that ended is subscribed to again, with a fresh snapshot.
                     if closed { sub = None; }
-                    let machines = if ask_machines || terminals { core.call("machine.list", json!({})).ok() } else { None };
+                    let machines = if ask_machines { core.call("machine.list", json!({})).ok() } else { None };
                     let listed = terminals.then(|| event_lines.live());
                     (sub, machines, refresh, listed, event_lines)
                 }).await;
@@ -696,7 +696,7 @@ impl AppWindow {
                 subscription = sub;
                 event_lines = lines;
                 let (seen, resynced) = event_lines.take_seen();
-                if this.update_in(cx, |this, window, cx| {
+                if (machines.is_some() || refresh || listed.is_some() || !watching || resynced || !seen.is_empty()) && this.update_in(cx, |this, window, cx| {
                     if generation != this.core_generation { return; }
                     // Our seen writes the core has applied (or, after a fresh
                     // snapshot, can't tell): its labels decide again.
