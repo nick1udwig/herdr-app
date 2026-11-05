@@ -111,7 +111,7 @@ pub struct TerminalView {
     /// The window frame this terminal was last put on screen in (`FRAME`).
     shown_in: Rc<Cell<u64>>,
     /// When the person last typed here: output right after is shown at once.
-    typed_at: Cell<Option<Instant>>,
+    typed_at: Rc<Cell<Option<Instant>>>,
     /// Scrolled this gesture, in lines, toward the next whole one.
     scrolled: Point<f32>,
     /// Search UI and query belong to this terminal view, not the window. Each
@@ -256,7 +256,7 @@ impl TerminalView {
             focus: cx.focus_handle(),
             was_focused: false,
             shown_in: Rc::new(Cell::new(0)),
-            typed_at: Cell::new(None),
+            typed_at: Rc::new(Cell::new(None)),
             scrolled: point(0.0, 0.0),
             search_open: false,
             search_keys: false,
@@ -309,18 +309,25 @@ impl TerminalView {
         };
         let address = self.address.clone();
         let shown_in = self.shown_in.clone();
+        let typed_at = self.typed_at.clone();
         // Replacing the task drops an attach still in flight for an older connection.
         self._reader = Some(cx.spawn(async move |this, cx| {
             let attached = cx.background_executor().spawn(async move { core.attach(&address, cols, rows, facts) }).await;
             let Ok(Some(rx)) = this.update(cx, |this, cx| this.attached(attached, (cols, rows), announce_end, cx)) else {
                 return;
             };
+            let mut received_at: Option<Instant> = None;
             while let Ok(first) = rx.recv().await {
-                if shown_in.get() != FRAME.load(Ordering::Relaxed) && matches!(&first, Stream::Data(_)) {
+                let burst = received_at.is_some_and(|at| at.elapsed() < Duration::from_millis(16));
+                received_at = Some(Instant::now());
+                if matches!(&first, Stream::Data(_)) && batch_output(shown_in.get() == FRAME.load(Ordering::Relaxed), typed_at.get().map(|at| at.elapsed()), burst) {
                     cx.background_executor().timer(Duration::from_millis(16)).await;
                 }
+                let mut bytes = match &first { Stream::Data(bytes) => bytes.len(), _ => 0 };
                 let mut batch = vec![first];
-                while let Ok(more) = rx.try_recv() {
+                while bytes < 256 * 1024 {
+                    let Ok(more) = rx.try_recv() else { break };
+                    if let Stream::Data(data) = &more { bytes += data.len(); }
                     append_output(&mut batch, more);
                 }
                 let alive = this.update(cx, |this, cx| this.ingest(batch, cx));
@@ -1821,6 +1828,10 @@ impl EntityInputHandler for TerminalView {
     }
 }
 
+fn batch_output(shown: bool, since_typed: Option<Duration>, burst: bool) -> bool {
+    !shown || burst && since_typed.is_none_or(|elapsed| elapsed >= Duration::from_millis(200))
+}
+
 fn append_output(batch: &mut Vec<Stream>, item: Stream) {
     match (batch.last_mut(), item) {
         (Some(Stream::Data(pending)), Stream::Data(bytes)) if pending.len() + bytes.len() <= 64 * 1024 => pending.extend(bytes),
@@ -2149,6 +2160,16 @@ impl Focusable for TerminalView {
 mod tests {
     use super::{ScrollTarget, pages_to_lines, scroll_target};
     use serde_json::{Value, json};
+
+    #[test]
+    fn visible_output_batches_except_for_immediate_keyboard_echo() {
+        use std::time::Duration;
+        assert!(super::batch_output(true, None, true));
+        assert!(!super::batch_output(true, None, false));
+        assert!(!super::batch_output(true, Some(Duration::from_millis(199)), true));
+        assert!(super::batch_output(true, Some(Duration::from_millis(200)), true));
+        assert!(super::batch_output(false, Some(Duration::ZERO), false));
+    }
 
     #[test]
     fn output_batches_preserve_split_sequences_and_close_order() {
