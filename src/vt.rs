@@ -735,7 +735,7 @@ impl Vt {
                 drag,
                 release,
                 drawn: Default::default(),
-            drawn_rows: Vec::new(),
+                drawn_rows: Vec::new(),
                 seen: HashMap::new(),
                 seen_with: (0, 0),
                 placements_cache: RefCell::new(None),

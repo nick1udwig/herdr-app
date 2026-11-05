@@ -90,7 +90,7 @@ export default class Files extends View {
     if (!cwd || this.loading) return;
     const context = this.context;
     this.loading = true;
-    this.limited = false;
+    if (!paths) this.limited = false;
     cx.spawn(async cx => {
       try {
         for (const path of ["", ...this.folders]) {
