@@ -61,9 +61,21 @@ fn mod_file_counts(rest: std::path::Components) -> bool {
 /// Folders mods watch (`watchFolder`): one OS watcher each, shared by every
 /// mod waiting on it. Bounded invalidations collect even while nobody waits.
 struct Folder {
-    _watcher: std::sync::mpsc::Sender<()>,
+    _watcher: FolderStop,
     waiters: Vec<async_channel::Sender<Vec<String>>>,
     pending: HashSet<String>,
+}
+
+struct FolderStop {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    wake: std::sync::mpsc::SyncSender<notify::Result<notify::Event>>,
+}
+
+impl Drop for FolderStop {
+    fn drop(&mut self) {
+        self.stop.take();
+        let _ = self.wake.try_send(Err(notify::Error::generic("watch stopped")));
+    }
 }
 
 static FOLDERS: OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Folder>>> = OnceLock::new();
@@ -222,11 +234,12 @@ fn collect_event(event: notify::Event, root: &Path, directories: &HashSet<PathBu
     refresh
 }
 
-fn start_folder(root: &Path) -> Result<std::sync::mpsc::Sender<()>, String> {
+fn start_folder(root: &Path) -> Result<FolderStop, String> {
     let mut directories = watch_directories(root).inspect_err(|e| tracing::warn!("{e}"))?;
     let (tx, events) = std::sync::mpsc::sync_channel(1024);
     let overflow = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lost = overflow.clone();
+    let wake = tx.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         if event.as_ref().is_ok_and(|e| !e.need_rescan() && matches!(e.kind, notify::EventKind::Access(_))) {
             return;
@@ -243,6 +256,7 @@ fn start_folder(root: &Path) -> Result<std::sync::mpsc::Sender<()>, String> {
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
         'watching: loop {
+            let Ok(first) = events.recv() else { break };
             if matches!(stopped.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)) {
                 break;
             }
@@ -250,8 +264,9 @@ fn start_folder(root: &Path) -> Result<std::sync::mpsc::Sender<()>, String> {
             let mut pending = HashSet::new();
             let mut refresh = false;
             let mut removed = HashSet::new();
+            let mut first = Some(first);
             while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
-                match events.recv_timeout(left) {
+                match first.take().map(Ok).unwrap_or_else(|| events.recv_timeout(left)) {
                     Ok(Ok(event)) => {
                         refresh |= collect_event(event, &root, &directories, &mut pending, &mut removed);
                     }
@@ -311,7 +326,7 @@ fn start_folder(root: &Path) -> Result<std::sync::mpsc::Sender<()>, String> {
             }
         }
     });
-    Ok(stop)
+    Ok(FolderStop { stop: Some(stop), wake })
 }
 
 fn deliver_pending(root: &Path, pending: HashSet<String>) -> bool {
