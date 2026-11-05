@@ -499,6 +499,7 @@ pub struct Vt {
     /// The cursor, the kitty images and the colors as last drawn: changes to
     /// them don't mark the render state dirty.
     drawn: (CursorKey, u64, u64),
+    drawn_rows: Vec<Rc<Vec<Cell>>>,
     /// The rows read last frame by libghostty's row id, with their selection:
     /// one that isn't dirty is the same row and isn't read again.
     seen: HashMap<[u64; 2], (Rc<Vec<Cell>>, Option<(u16, u16)>)>,
@@ -734,6 +735,7 @@ impl Vt {
                 drag,
                 release,
                 drawn: Default::default(),
+            drawn_rows: Vec::new(),
                 seen: HashMap::new(),
                 seen_with: (0, 0),
                 placements_cache: RefCell::new(None),
@@ -1495,13 +1497,8 @@ impl Vt {
         if self.shared.held_since.is_some() {
             return true;
         }
-        unsafe {
-            let state = self.shared.state;
-            ghostty_render_state_update(state, self.term);
-            let mut dirty: GhosttyRenderStateDirty = GHOSTTY_RENDER_STATE_DIRTY_FULL;
-            ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_DIRTY, &mut dirty as *mut _ as *mut c_void);
-            dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE || self.drawable() != self.drawn
-        }
+        let frame = self.read_frame();
+        frame.rows != self.drawn_rows || unsafe { self.drawable() } != self.drawn
     }
 
     /// The cursor and the colors (from the updated render state), and the kitty
@@ -1530,6 +1527,13 @@ impl Vt {
 
     /// Updates the render state (respecting synchronized output) and reads one frame.
     pub fn frame(&mut self) -> Frame {
+        let frame = self.read_frame();
+        self.drawn_rows = frame.rows.clone();
+        self.drawn = unsafe { self.drawable() };
+        frame
+    }
+
+    fn read_frame(&mut self) -> Frame {
         unsafe {
             if let Some(since) = self.shared.held_since
                 && since.elapsed() > MAX_HOLD
@@ -1606,7 +1610,6 @@ impl Vt {
                 color: if colors.cursor_has_value { colors.cursor.into() } else { fg_default },
             });
 
-            self.drawn = self.drawable();
             ghostty_render_state_clean(state);
             let cursor_cell = cur.viewport_has_value.then_some((cur.viewport_x, cur.viewport_y));
             Frame { rows, cursor, cursor_cell, bg: bg_default, search_spans: self.search_spans.clone() }
@@ -1936,6 +1939,25 @@ mod tests {
         assert_eq!(f.rows[1][2].text, "!");
         let c = f.cursor.unwrap();
         assert_eq!((c.x, c.y), (3, 1));
+    }
+
+    #[test]
+    fn repeated_output_only_redraws_when_the_final_screen_changes() {
+        let mut vt = Vt::new(20, 3);
+        vt.write(b"hello\r");
+        vt.frame();
+        vt.write(b"hello\r");
+        assert!(!vt.shows_change());
+        vt.write(b"world\r");
+        assert!(vt.shows_change());
+        assert!(vt.shows_change(), "a pending paint must stay pending");
+        vt.frame();
+        assert!(!vt.shows_change());
+        vt.write(b"\x1b[2;1H");
+        assert!(vt.shows_change(), "cursor movement still draws");
+        vt.frame();
+        vt.write(b"\x1b]4;1;rgb:12/34/56\x1b\\");
+        assert!(vt.shows_change(), "palette changes still draw");
     }
 
     #[test]
