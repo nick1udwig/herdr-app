@@ -31,7 +31,7 @@ export function writeTextFile(path: string, text: string, expected: string | nul
 /** The agents people can start from a menu (entries with `run` in programs.json), most picked
  *  first, and whether each is installed: asked of the shell agents start in (on another machine,
  *  `on`, its login/interactive shell when supported), at most once a minute per machine.
- *  Start one with its `run` as `argv`. */
+ *  Rejects if the check fails; failed checks are not cached. Start one with its `run` as `argv`. */
 export function knownAgents(options?: { on?: string | null }): Promise<(Program & { run: string[]; installed: boolean })[]>;
 
 /** Opens the system's folder picker (this machine). Resolves with the chosen folder, or null
@@ -56,7 +56,8 @@ export function playSound(sound: string): null;
  *   tab.close {id?}, tab.rename {id?, name}, tab.move {id, index}, tab.select {index | id},
  *   tab.next, tab.prev.
  * Panes: pane.split {direction: "right" | "down", pane?}, pane.close {pane?}, pane.zoom {pane?},
- *   pane.focus {pane | terminal}, pane.go {direction}, pane.swap {direction}. Pane menus get target { pane, terminal }.
+ *   pane.focus {pane | terminal}, pane.go {direction}, pane.swap {pane?, direction | target}.
+ *   Pane menus get target { pane, terminal }.
  * Terminals: terminal.open {argv?, folder?, place?: "tab" | "right" | "down"}, terminal.kill {terminal},
  *   terminal.keep {terminal, place?} (a running one without a pane, e.g. a sub-agent, gets one),
  *   terminal.park {terminal} (its pane goes, it keeps running; the menu's "Send back"),
@@ -214,7 +215,9 @@ export function setAgentOrder(addresses: string[]): null;
 
 /** Every core terminal as `hc ls --json` describes it (address, argv, name, template, parent,
  *  labels, state, ...), with `status` as a plain word, the agent's report in `report`, and
- *  `program` (see Program). Live. */
+ *  `program` (see Program). Parent addresses use the same machine names as `address`;
+ *  parents on this computer use bare terminal IDs. Parents that cannot be mapped
+ *  stay as the core reported them. Live. */
 export function terminals(): any[];
 
 /** Actual terminal/pane focus. `space` and `tab` are the current window context.

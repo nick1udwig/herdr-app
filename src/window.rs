@@ -455,7 +455,7 @@ pub struct AppWindow {
     /// The system's appearance; a layout with a light and a dark theme follows it.
     system_dark: bool,
     /// The OS tells us when files change (`files.rs`); else the disk is polled.
-    file_events: Option<async_channel::Receiver<crate::files::Changed>>,
+    file_events: Option<crate::files::FileEvents>,
     maintenance_at: Instant,
     hidden_fit_task: Option<Task<()>>,
     /// The downloaded update the frame's pill offers, and the one closed for now.
@@ -476,6 +476,10 @@ pub struct AppWindow {
 impl AppWindow {
     pub fn new(core: Arc<Core>, requests: async_channel::Receiver<Request>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let runtime = ShellRuntime::new(cx).map_err(|e| tracing::error!("script runtime failed, mods are off: {e:#}")).ok();
+        let file_events = crate::files::watch(&mods::app_dir(), #[cfg(test)] cx.background_executor().clone());
+        if let (Some(runtime), Some(events)) = (&runtime, &file_events) {
+            runtime.set_source_revision_provider(events.revision_provider());
+        }
         mods::note_fonts(cx);
         let seen = std::fs::read_to_string(file("seen.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
         let mut w = AppWindow {
@@ -545,7 +549,7 @@ impl AppWindow {
             pane_history: Vec::new(),
             window_active: true,
             system_dark: is_dark(window.appearance()),
-            file_events: crate::files::watch(&mods::app_dir()),
+            file_events,
             maintenance_at: Instant::now(),
             hidden_fit_task: None,
             update_ready: None,
@@ -599,10 +603,10 @@ impl AppWindow {
         cx.observe_window_appearance(window, |this, window, cx| this.poll(window, cx)).detach();
         if let Some(events) = w.file_events.clone() {
             w._tasks.push(cx.spawn_in(window, async move |this, cx| {
-                while let Ok(mut changed) = events.recv().await {
+                while let Ok(mut changed) = events.changes.recv().await {
                     // An editor's save is several events: take them together.
                     cx.background_executor().timer(Duration::from_millis(80)).await;
-                    while let Ok(more) = events.try_recv() {
+                    while let Ok(more) = events.changes.try_recv() {
                         changed.extend(more);
                     }
                     if this.update_in(cx, |this, window, cx| this.files_changed(changed, window, cx)).is_err() {
@@ -625,6 +629,7 @@ impl AppWindow {
             let mut subscription = None;
             let mut subscribed_generation = u64::MAX;
             let mut event_lines = crate::hc::EventLines::default();
+            let mut known_machines = Value::Null;
             let mut relist = false;
             let mut pending_event = None;
             let mut machines_at = Instant::now();
@@ -662,7 +667,7 @@ impl AppWindow {
                 if ask_machines { machines_at = Instant::now() + Duration::from_millis(2500); }
                 let relisting = std::mem::take(&mut relist);
                 let mut first = pending_event.take();
-                let (sub, machines, refresh, listed, lines) = cx.background_executor().spawn(async move {
+                let (sub, machines, refresh, listed, lines, machine_names) = cx.background_executor().spawn(async move {
                     // The local stream forwards remote doc events too.
                     let mut sub = subscription;
                     let (mut refresh, mut terminals) = (false, relisting);
@@ -684,13 +689,16 @@ impl AppWindow {
                     }
                     // A stream that ended is subscribed to again, with a fresh snapshot.
                     if closed { sub = None; }
-                    let machines = if ask_machines { core.call("machine.list", json!({})).ok() } else { None };
-                    let listed = terminals.then(|| event_lines.live());
-                    (sub, machines, refresh, listed, event_lines)
+                    let machines = if ask_machines || terminals { core.call("machine.list", json!({})).ok() } else { None };
+                    let machines_changed = machines.as_ref().is_some_and(|m| m != &known_machines);
+                    if let Some(m) = &machines { known_machines = m.clone(); }
+                    let listed = (terminals || machines_changed).then(|| event_lines.live_for(&core.hello, &known_machines));
+                    (sub, machines, refresh, listed, event_lines, known_machines)
                 }).await;
                 let watching = sub.is_some();
                 subscription = sub;
                 event_lines = lines;
+                known_machines = machine_names;
                 let (seen, resynced) = event_lines.take_seen();
                 if (ask_machines || machines.is_some() || refresh || listed.is_some() || !watching || resynced || !seen.is_empty()) && this.update_in(cx, |this, window, cx| {
                     if generation != this.core_generation { return; }
@@ -1406,6 +1414,20 @@ impl AppWindow {
         let (model, live) = (&self.model, &self.live);
         self.swapped.retain(|p, a| model.address_of(p).is_some() && live.contains_key(a));
         let (mut terms, mods_visible) = self.visible();
+        let covered: HashSet<&str> = terms.iter().filter_map(|(slot, _)| slot.strip_suffix(SWAP)).collect();
+        let mut displayed: HashSet<String> = terms.iter().filter(|(slot, _)| !covered.contains(slot.as_str())).map(|(slot, _)| slot.clone()).collect();
+        // Agent blocks reuse their agent's pane view even when its tab isn't shown.
+        if self.shows_agent()
+            && let Some(addr) = self.shown_agent()
+            && let Some(pane) = self.model.pane_of(&addr)
+        {
+            displayed.insert(pane);
+        }
+        for (id, t) in &self.terms {
+            if !displayed.contains(id) {
+                t.view.update(cx, |v, _| v.blur());
+            }
+        }
         // Every tab's terminals stay attached (only visible ones are drawn): tab
         // switches are instant and kitty images survive, which a repaint can't bring back.
         for c in self.model.tabs() {
@@ -2032,7 +2054,7 @@ impl AppWindow {
             obj.insert("program".into(), program_of(&report, running_argv(obj)));
             obj.insert("report".into(), report);
             // As the panes show it: a spinning title would change every listing.
-            if let Some(title) = obj.get("title").and_then(Value::as_str).map(|t| crate::terminal::shown_title(t).to_owned()) {
+            if let Some(title) = obj.get("title").and_then(Value::as_str).map(|t| crate::terminal::shown_title(t).into_owned()) {
                 obj.insert("title".into(), title.into());
             }
             if let Some(a) = obj.get("address").and_then(Value::as_str) {
@@ -2145,7 +2167,7 @@ impl AppWindow {
         if QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
             return false;
         }
-        let missing = self.model.tabs().flat_map(|c| c.root.terminals())
+        let missing = self.model.tabs().flat_map(|c| c.root.terminals()).chain(self.chrome.terminals())
             .filter_map(|n| n.terminal().filter(|a| !self.live.contains_key(*a) && !self.just_born(a)).map(|a| (n.id.clone(), a.to_owned())))
             .collect::<Vec<_>>();
         if !missing.is_empty() && !self.checking_closed {
@@ -2317,10 +2339,6 @@ impl AppWindow {
             let id = o.id.clone();
             return self.close_overlay(&id, window, cx);
         }
-        if self.chrome.find(block).is_some_and(|n| n.terminal().is_some()) {
-            self.chrome.remove(block);
-            self.sync(window, cx);
-        }
         // How its stream ended, for `reconcile` (`hc run --rm` leaves no record).
         if let Some(t) = self.terms.get(block)
             && let Some(why) = t.view.read(cx).ended.clone()
@@ -2328,6 +2346,10 @@ impl AppWindow {
             // The program ended on its own (or was killed): its pane goes now. A
             // stream that just broke (the core died) says neither.
             let closed = matches!(why.as_str(), "exited" | "killed" | "finished");
+            if closed && self.chrome.find(block).and_then(Node::terminal) == Some(t.address.as_str()) {
+                self.chrome.remove_slot(block);
+                return self.sync(window, cx);
+            }
             if closed && self.model.address_of(block).as_deref() == Some(t.address.as_str()) {
                 self.model.remove_pane(block);
                 return self.sync(window, cx);
@@ -2528,26 +2550,40 @@ impl AppWindow {
         let core = self.core.clone();
         let generation = self.core_generation;
         cx.spawn_in(window, async move |this, cx| {
-            let closed = cx.background_executor().spawn(async move {
-                missing.into_iter().filter(|(_, addr)| match core.call("terminal.get", json!({"terminal":addr})) {
-                    Ok(v) => matches!(v["reason"].as_str(), Some("exited" | "killed")),
-                    Err(e) => crate::hc::error_kind(&e) == Some("not_found"),
+            let checked = cx.background_executor().spawn(async move {
+                missing.into_iter().map(|(pane, addr)| {
+                    let result = core.call("terminal.get", json!({"terminal":addr}));
+                    (pane, addr, result)
                 }).collect::<Vec<_>>()
             }).await;
-            let _ = this.update_in(cx, |this, window, cx| {
-                this.checking_closed = false;
-                if generation != this.core_generation { return; }
-                let mut changed = false;
-                for (pane, addr) in closed {
-                    if this.model.address_of(&pane).as_deref() == Some(&addr) {
-                        this.notify_launch_failure(&addr, window, cx);
-                        this.model.remove_pane(&pane);
-                        changed = true;
-                    }
-                }
-                if changed { this.sync(window, cx); }
-            });
+            let _ = this.update_in(cx, |this, window, cx| this.checked_closed(generation, checked, window, cx));
         }).detach();
+    }
+
+    fn checked_closed(&mut self, generation: u64, checked: Vec<(String, String, anyhow::Result<Value>)>, window: &mut Window, cx: &mut Context<Self>) {
+        self.checking_closed = false;
+        if generation != self.core_generation { return; }
+        let mut changed = false;
+        for (pane, addr, result) in checked {
+            if self.chrome.find(&pane).and_then(Node::terminal) == Some(addr.as_str()) {
+                // A failed lookup is not evidence the program exited.
+                if result.as_ref().is_ok_and(|v| v["state"] == "finished") {
+                    self.chrome.remove_slot(&pane);
+                    changed = true;
+                }
+            } else if self.model.address_of(&pane).as_deref() == Some(&addr) {
+                let closed = match result {
+                    Ok(v) => matches!(v["reason"].as_str(), Some("exited" | "killed")),
+                    Err(e) => crate::hc::error_kind(&e) == Some("not_found"),
+                };
+                if closed {
+                    self.notify_launch_failure(&addr, window, cx);
+                    self.model.remove_pane(&pane);
+                    changed = true;
+                }
+            }
+        }
+        if changed { self.sync(window, cx); }
     }
 
     fn just_born(&self, addr: &str) -> bool {
@@ -2710,7 +2746,22 @@ impl AppWindow {
     fn run_action(&mut self, action: &str, window: &mut Window, cx: &mut Context<Self>) {
         // `send:` is only meaningful in a terminal, which handles it before it gets here.
         if !action.starts_with("send:") {
-            self.run(action, Value::Null, window, cx);
+            self.run_key(action, Value::Null, window, cx);
+        }
+    }
+
+    fn run_key(&mut self, name: &str, args: Value, window: &mut Window, cx: &mut Context<Self>) {
+        // Close the dialog holding the keyboard, not the terminal behind it.
+        let implicit_close = match crate::keys::current(name).as_str() {
+            "tab.close" => Self::arg(&args, "id").is_none(),
+            "pane.close" => Self::arg(&args, "pane").is_none(),
+            _ => false,
+        };
+        if implicit_close && self.overlays.iter().any(|o| o.kind.modal_keys())
+        {
+            self.run("overlay.close", json!({}), window, cx);
+        } else {
+            self.run(name, args, window, cx);
         }
     }
 
@@ -3037,15 +3088,29 @@ impl AppWindow {
                 self.agent = self.model.address_of(&p);
                 self.swapped.remove(&p);
             }
-            "pane.go" | "pane.swap" => {
+            "pane.go" => {
                 let dir = Self::arg(a, "direction").unwrap_or_default();
                 if !matches!(dir, "left" | "right" | "up" | "down") {
                     return self.fail(format!("{name} direction is left, right, up or down, not {dir:?}"));
                 }
-                if name == "pane.go" {
-                    return self.go(dir, window, cx);
+                return self.go(dir, window, cx);
+            }
+            "pane.swap" => {
+                let by = match swap_by(a) {
+                    Ok(by) => by,
+                    Err(e) => return self.fail(e),
+                };
+                let explicit = Self::arg(a, "pane").is_some();
+                let pane = Self::owned(a, "pane").or_else(|| self.model.focused_pane());
+                let r = match (by, pane) {
+                    (SwapBy::Direction(dir), Some(pane)) => self.swap_pane(&pane, explicit, dir),
+                    (SwapBy::Direction(_), None) => Ok(()),
+                    (SwapBy::Target(target), Some(pane)) => self.model.swap_panes(&pane, target),
+                    (SwapBy::Target(_), None) => Err("no pane to swap".into()),
+                };
+                if let Err(e) = r {
+                    return self.fail(e);
                 }
-                self.swap_pane(dir);
             }
             // ---- terminals
             "terminal.open" => {
@@ -3478,15 +3543,9 @@ impl AppWindow {
         self.copies.get(id).and_then(|c| self.folders.get(&c.inst.name)).is_some_and(|f| f.hint.focusable)
     }
 
-    /// Swaps the focused pane with its neighbor in a direction.
-    fn swap_pane(&mut self, dir: &str) {
-        if let Some(from) = self.model.focused_pane()
-            && let Some(to) = self.neighbor(&from, dir, false)
-            && let Some(ctx) = self.model.tab_of(&from).map(|c| c.id.clone())
-            && let Some(c) = self.model.tab_mut(&ctx)
-        {
-            c.root.swap(&from, &to);
-        }
+    fn swap_pane(&mut self, from: &str, explicit: bool, dir: &str) -> Result<(), String> {
+        let neighbor = self.neighbor(from, dir, false);
+        swap_with_neighbor(&mut self.model, from, explicit, neighbor)
     }
 
     // ---- overlays ----------------------------------------------------------
@@ -3514,6 +3573,17 @@ impl AppWindow {
         self.open_overlay(mods::new_overlay_id(), spec, window, cx);
     }
 
+    /// The layout's notification mod (`"toast"` on the root), else the shipped `toast`.
+    fn toast_mod(&self) -> &str {
+        let requested = self.chrome.toast.as_deref().unwrap_or("toast");
+        if self.folders.contains_key(requested) {
+            requested
+        } else {
+            tracing::warn!(mod_name = requested, "toast mod not found; using toast");
+            "toast"
+        }
+    }
+
     fn open_overlay(&mut self, id: String, spec: Value, window: &mut Window, cx: &mut Context<Self>) {
         let kind = match spec.get("kind").and_then(Value::as_str) {
             Some("popup") => OverlayKind::Popup,
@@ -3538,7 +3608,7 @@ impl AppWindow {
             }
         });
         let (name, mut props) = if kind == OverlayKind::Toast {
-            ("toast".to_owned(), spec.get("notification").cloned().unwrap_or(Value::Null))
+            (self.toast_mod().to_owned(), spec.get("notification").cloned().unwrap_or(Value::Null))
         } else {
             (spec.get("mod").and_then(Value::as_str).unwrap_or_default().to_owned(), spec.get("props").cloned().unwrap_or(json!({})))
         };
@@ -4241,14 +4311,15 @@ impl AppWindow {
         let Some(d) = &self.drag else { return };
         let (container, index, axis) = (d.container.clone(), d.index, d.axis);
         let Some(node) = self.find_node_mut(&container).map(|n| n.clone()) else { return };
+        if !node.resizable() { return; }
         let shown: Vec<&Node> = node.children().iter().filter(|c| !c.hidden).collect();
         let (Some(a), Some(b)) = (shown.get(index), shown.get(index + 1)) else { return };
         let bounds = self.bounds.borrow();
         let (Some(ba), Some(bb)) = (bounds.get(&a.id).copied(), bounds.get(&b.id).copied()) else { return };
         drop(bounds);
-        let (start, end, p) = match axis {
-            Axis::Row => (f32::from(ba.left()), f32::from(bb.right()), f32::from(pos.x)),
-            Axis::Column => (f32::from(ba.top()), f32::from(bb.bottom()), f32::from(pos.y)),
+        let (start, p) = match axis {
+            Axis::Row => (f32::from(ba.left()), f32::from(pos.x)),
+            Axis::Column => (f32::from(ba.top()), f32::from(pos.y)),
         };
         let (la, lb) = match axis {
             Axis::Row => (f32::from(ba.size.width), f32::from(bb.size.width)),
@@ -4256,9 +4327,11 @@ impl AppWindow {
         };
         // Measured on screen; sizes are stored as designed (unzoomed).
         let zoom = settings::zoom();
-        let (la, lb, start, end, p) = (la / zoom, lb / zoom, start / zoom, end / zoom, p / zoom);
+        let (la, lb, start, p) = (la / zoom, lb / zoom, start / zoom, p / zoom);
         let total = la + lb;
-        let mut new_a = (p - start).clamp(24.0, (end - start) - 24.0);
+        // Squeezed and zero-size siblings cannot both keep the drag minimum.
+        if total <= 48.0 { return; }
+        let mut new_a = (p - start).clamp(24.0, total - 24.0);
         if let Some(min) = a.min {
             new_a = new_a.max(min);
         }
@@ -4593,10 +4666,46 @@ fn overlay_terminal_block<'a>(overlays: &'a [Overlay], id: Option<&str>) -> Opti
     overlays.iter().filter_map(|o| o.layout.as_ref()).find_map(|l| l.visible_blocks().into_iter().find(|n| n.id == id && n.terminal().is_some()))
 }
 
+#[derive(Debug, PartialEq)]
+enum SwapBy<'a> {
+    Direction(&'a str),
+    Target(&'a str),
+}
+
+fn swap_with_neighbor(model: &mut Model, from: &str, explicit: bool, neighbor: Option<String>) -> Result<(), String> {
+    if explicit && model.tab_of(from).and_then(|c| c.root.find(from)).is_none_or(|n| !n.is_pane()) {
+        return Err(format!("no pane {from:?}"));
+    }
+    let shown = model.active_tab().is_some_and(|c| c.shown().visible_blocks().iter().any(|n| n.id == from));
+    if explicit && !shown {
+        return Err(format!("pane.swap direction needs a pane in the shown tab, not {from:?}"));
+    }
+    if let Some(to) = neighbor
+        && let Some(ctx) = model.tab_of(from).map(|c| c.id.clone())
+        && let Some(c) = model.tab_mut(&ctx)
+    {
+        c.root.swap(from, &to);
+    }
+    Ok(())
+}
+
+fn swap_by(args: &Value) -> Result<SwapBy<'_>, String> {
+    if args.get("direction").is_some_and(|d| !d.is_string() && !d.is_null()) {
+        return Err("pane.swap direction must be a string (or null to omit it)".into());
+    }
+    match (AppWindow::arg(args, "direction"), AppWindow::arg(args, "target")) {
+        (Some(_), Some(_)) => Err("pane.swap takes direction or target, not both".into()),
+        (None, None) => Err("pane.swap needs direction or target".into()),
+        (None, Some(target)) => Ok(SwapBy::Target(target)),
+        (Some(dir @ ("left" | "right" | "up" | "down")), None) => Ok(SwapBy::Direction(dir)),
+        (Some(dir), None) => Err(format!("pane.swap direction is left, right, up or down, not {dir:?}")),
+    }
+}
+
 fn needs_model_pane(name: &str, args: &Value) -> bool {
     match name {
-        "pane.split" | "pane.close" | "pane.zoom" | "terminal.show" => AppWindow::arg(args, "pane").is_none(),
-        "pane.go" | "pane.swap" => true,
+        "pane.split" | "pane.close" | "pane.zoom" | "pane.swap" | "terminal.show" => AppWindow::arg(args, "pane").is_none(),
+        "pane.go" => true,
         "terminal.open" | "terminal.keep" => matches!(AppWindow::arg(args, "place"), Some("right" | "down")),
         _ => false,
     }
@@ -4693,9 +4802,13 @@ fn dock(root: &mut Node, block: Node, place: &str, wrapper_id: String) {
         if first { c.insert(0, block) } else { c.push(block) }
         return;
     }
-    let old = std::mem::replace(root, Node::new("", Kind::Row { children: vec![] }));
+    let mut old = std::mem::replace(root, Node::new("", Kind::Row { children: vec![] }));
+    let toast = old.toast.take();
+    let terminal_menu = old.terminal_menu.take();
     let children = if first { vec![block, old] } else { vec![old, block] };
     let mut wrapper = Node::container(wrapper_id, axis, children);
+    wrapper.toast = toast;
+    wrapper.terminal_menu = terminal_menu;
     wrapper.divider = Some(Line { width: 1.0, color: "border".into() });
     *root = wrapper;
 }
@@ -4867,7 +4980,7 @@ impl Render for AppWindow {
                             w.dispatch_action(action, cx);
                             return;
                         }
-                        this.run(&name, args, w, cx);
+                        this.run_key(&name, args, w, cx);
                     }
                     Err(error) => this.command_error("Key binding", &error, w, cx),
                 }
@@ -5088,7 +5201,7 @@ mod tests {
         let old = cx.update(|cx| cx.cached_asset::<ImgResourceLoader>(&resource)).unwrap().unwrap();
         let context = cx.add_empty_window();
         let displayed = old.clone();
-        assert_eq!(old.frame_count(), 2);
+        assert_eq!(old.frame_count(), 1);
         context.draw(point(px(0.0), px(0.0)), size(px(20.0), px(20.0)), move |_, _| {
             gpui::canvas(|_, _, _| (), move |bounds, _, window, _| {
                 for frame in 0..displayed.frame_count() {
@@ -5105,6 +5218,217 @@ mod tests {
             super::invalidate_image(&missing, window, cx);
             assert!(!cx.has_asset::<ImgResourceLoader>(&missing));
         });
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[gpui::test]
+    fn still_image_cache_is_bounded_and_avoids_repeat_downloads(cx: &mut TestAppContext) {
+        use gpui::{ImgResourceLoader, Resource, http_client::{AsyncBody, FakeHttpClient, Response}};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]))
+            .write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        let bytes = bytes.into_inner();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        cx.update(|cx| cx.set_http_client(FakeHttpClient::create(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let bytes = bytes.clone();
+            async move { Ok(Response::builder().status(200).body(AsyncBody::from(bytes)).unwrap()) }
+        })));
+        let context = cx.add_empty_window();
+        context.deactivate_window();
+        let sources: Vec<_> = (0..130).map(|id| Resource::Uri(format!("http://images.test/{id}.png").into())).collect();
+        for source in &sources {
+            context.update(|_, cx| { cx.fetch_asset::<ImgResourceLoader>(source); });
+            context.run_until_parked();
+        }
+        context.update(|window, cx| { window.draw(cx).clear(cx); });
+        assert_eq!(context.update(|_, cx| sources.iter().filter(|source| cx.has_asset::<ImgResourceLoader>(source)).count()), 128);
+        let retained = sources.last().unwrap();
+        assert!(context.update(|_, cx| cx.fetch_asset::<ImgResourceLoader>(retained)).unwrap().is_ok());
+        assert_eq!(requests.load(Ordering::SeqCst), 130);
+        assert!(!context.update(|_, cx| cx.has_asset::<ImgResourceLoader>(&sources[0])));
+        context.update(|window, cx| {
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+            window.remove_window();
+        });
+    }
+
+    #[gpui::test]
+    fn closing_last_window_releases_many_animation_sources_in_one_call(cx: &mut TestAppContext) {
+        use gpui::{ImgResourceLoader, Resource, img};
+        use std::sync::Arc;
+        struct Images(Vec<Resource>);
+        impl Render for Images {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().children(self.0.iter().enumerate().map(|(id, source)| {
+                    img(gpui::ImageSource::Resource(source.clone())).id(id).size_4()
+                }))
+            }
+        }
+        let mut gif = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+            for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
+                encoder.encode_frame(image::Frame::new(image::RgbaImage::from_pixel(2, 2, image::Rgba(color)))).unwrap();
+            }
+        }
+        let temp = if cfg!(target_os = "linux") { std::path::PathBuf::from("/var/tmp") } else { std::env::temp_dir() };
+        let dir = temp.join(format!("herdr-many-images-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sources: Vec<_> = (0..24).map(|id| {
+            let path = dir.join(format!("{id}.gif"));
+            std::fs::write(&path, &gif).unwrap();
+            Resource::Path(path.into())
+        }).collect();
+        let (_, context) = cx.add_window_view(|_, _| Images(sources.clone()));
+        context.deactivate_window();
+        context.run_until_parked();
+        let mut images = context.update(|window, _| window.displayed_images());
+        assert_eq!(images.iter().filter(|image| image.frame_count() == 2).count(), 24);
+        images.extend(context.update(|_, cx| sources.iter().map(|source| cx.cached_asset::<ImgResourceLoader>(source).unwrap().unwrap()).collect::<Vec<_>>()));
+        let weak: Vec<_> = images.iter().map(Arc::downgrade).collect();
+        drop(images);
+        context.update(|window, cx| {
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+            window.remove_window();
+        });
+        assert!(weak.iter().all(|image| image.upgrade().is_none()), "one close must release every animation and its source regardless of hash order");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[gpui::test]
+    fn image_tiles_wait_for_both_scenes_before_retiring(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+        let context = cx.add_empty_window();
+        let image = Arc::new(gpui::RenderImage::new((0..3).map(|red| {
+            image::Frame::new(image::RgbaImage::from_pixel(2, 2, image::Rgba([red, 0, 0, 255])))
+        }).collect::<smallvec::SmallVec<[_; 1]>>()));
+        for frame in 0..3 {
+            let painted = image.clone();
+            context.draw(point(px(0.), px(0.)), size(px(20.), px(20.)), move |_, _| {
+                gpui::canvas(|_, _, _| (), move |bounds, _, window, _| {
+                    window.paint_image(bounds, bounds, gpui::Corners::default(), painted.clone(), frame, false).unwrap();
+                }).size_full()
+            });
+            for previous in 0..=frame {
+                assert_eq!(context.update(|window, _| window.has_image_frame_atlas_entry(&image, previous)), previous + 1 >= frame);
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn clipped_images_do_not_upload(cx: &mut TestAppContext) {
+        use std::sync::Arc;
+        let context = cx.add_empty_window();
+        let image = Arc::new(gpui::RenderImage::new(smallvec::smallvec![
+            image::Frame::new(image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255])))
+        ]));
+        for mask in [
+            gpui::Bounds::new(point(px(50.), px(50.)), size(px(10.), px(10.))),
+            gpui::Bounds::new(point(px(0.), px(0.)), size(px(0.), px(0.))),
+        ] {
+            for _ in 0..2 {
+                let painted = image.clone();
+                context.draw(point(px(0.), px(0.)), size(px(20.), px(20.)), move |_, _| {
+                    gpui::canvas(|_, _, _| (), move |bounds, _, window, _| {
+                        window.with_content_mask(Some(gpui::ContentMask { bounds: mask }), |window| {
+                            window.paint_image(bounds, bounds, gpui::Corners::default(), painted.clone(), 0, false).unwrap();
+                        });
+                    }).size_full()
+                });
+                assert!(!context.update(|window, _| window.has_image_frame_atlas_entry(&image, 0)));
+            }
+        }
+        let painted = image.clone();
+        context.draw(point(px(0.), px(0.)), size(px(20.), px(20.)), move |_, _| {
+            gpui::canvas(|_, _, _| (), move |bounds, _, window, _| {
+                window.paint_image(bounds, bounds, gpui::Corners::default(), painted.clone(), 0, false).unwrap();
+            }).size_full()
+        });
+        assert!(context.update(|window, _| window.has_image_frame_atlas_entry(&image, 0)));
+    }
+
+    #[gpui::test]
+    fn background_images_stay_warm_and_release_animations(cx: &mut TestAppContext) {
+        use gpui::{AssetSource as _, ImgResourceLoader, Resource, img};
+        use std::sync::Arc;
+        struct ImageProbe { source: Option<Resource>, animate: bool }
+        impl Render for ImageProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let mut element = div().size_full();
+                if let Some(source) = &self.source {
+                    element = element.child(img(gpui::ImageSource::Resource(source.clone())).size_4());
+                    if self.animate {
+                        element = element.child(img(gpui::ImageSource::Resource(source.clone())).id("animated").size_4());
+                    }
+                }
+                element
+            }
+        }
+        let temp = if cfg!(target_os = "linux") { std::path::PathBuf::from("/var/tmp") } else { std::env::temp_dir() };
+        let home = temp.join(format!("herdr-image-release-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let gif = home.join("animated.gif");
+        let png = home.join("still.png");
+        let mut encoder = image::codecs::gif::GifEncoder::new(std::fs::File::create(&gif).unwrap());
+        for color in [[255, 0, 0, 255], [0, 255, 0, 255]] {
+            encoder.encode_frame(image::Frame::new(image::RgbaImage::from_pixel(2, 2, image::Rgba(color)))).unwrap();
+        }
+        drop(encoder);
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255])).save(&png).unwrap();
+        let assets = gpui_shell::AppAssets::new(home.clone());
+        assert_eq!(
+            assets.image_resource(&Resource::Path(gif.clone().into())),
+            Resource::Path(gif.clone().into())
+        );
+        let (view, cx) = cx.add_window_view(|_, _| ImageProbe { source: None, animate: false });
+        cx.deactivate_window();
+        for file in [&gif, &png, &gif] {
+            let resource = Resource::Path(file.clone().into());
+            view.update(cx, |view, cx| { view.source = Some(resource.clone()); cx.notify(); });
+            cx.run_until_parked();
+            let image = cx.update(|_, cx| cx.cached_asset::<ImgResourceLoader>(&resource)).unwrap().unwrap();
+            assert_eq!(image.frame_count(), 1);
+            assert_eq!(&image.as_bytes(0).unwrap()[..4], &[0, 0, 255, 255]);
+            assert!(cx.update(|window, _| window.has_image_frame_atlas_entry(&image, 0)));
+            if file == &gif {
+                view.update(cx, |view, cx| { view.animate = true; cx.notify(); });
+                cx.run_until_parked();
+                let animation = cx.update(|window, _| window.displayed_images().into_iter().find(|image| image.frame_count() == 2)).unwrap();
+                assert_eq!(animation.as_bytes(0).unwrap().as_ptr(), image.as_bytes(0).unwrap().as_ptr());
+                let weak_animation = Arc::downgrade(&animation);
+                drop(animation);
+                view.update(cx, |view, cx| { view.animate = false; cx.notify(); });
+                cx.run_until_parked();
+                assert!(weak_animation.upgrade().is_none(), "a still background must not keep animation pixels");
+                assert!(cx.update(|window, _| window.has_image_frame_atlas_entry(&image, 0)));
+            }
+            let weak = Arc::downgrade(&image);
+            drop(image);
+            view.update(cx, |view, cx| { view.source = None; cx.notify(); });
+            cx.run_until_parked();
+            assert!(weak.upgrade().is_some(), "still pixels stay warm for layout switches");
+            view.update(cx, |view, cx| { view.source = Some(resource.clone()); cx.notify(); });
+            cx.update(|window, cx| { window.draw(cx).clear(cx); });
+            let warm = cx.update(|_, cx| cx.cached_asset::<ImgResourceLoader>(&resource)).unwrap().unwrap();
+            assert!(Arc::ptr_eq(&warm, &weak.upgrade().unwrap()));
+            assert!(cx.update(|window, _| window.has_image_frame_atlas_entry(&warm, 0)));
+            drop(warm);
+        }
+        // Leave both the source and animation unowned in the same close operation.
+        view.update(cx, |view, cx| { view.animate = true; cx.notify(); });
+        cx.run_until_parked();
+        let images = cx.update(|window, _| window.displayed_images());
+        let weak: Vec<_> = images.iter().map(Arc::downgrade).collect();
+        assert!(images.iter().any(|image| image.frame_count() == 2));
+        drop(images);
+        cx.update(|window, cx| {
+            cx.set_quit_mode(gpui::QuitMode::Explicit);
+            window.remove_window();
+        });
+        assert!(weak.iter().all(|image| image.upgrade().is_none()), "closing the last window must prune in dependency order without another draw");
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -5337,6 +5661,70 @@ mod tests {
     }
 
     #[test]
+    fn layout_terminals_survive_stream_loss_until_confirmed_closed() {
+        in_own_process("layout_terminal_stream_loss");
+    }
+
+    #[gpui::test]
+    fn layout_terminal_stream_loss(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("layout_terminal_stream_loss") {
+            return;
+        }
+        let (view, cx) = open_window(cx, "neighbor", "", json!({
+            "id": "root", "type": "row", "children": [
+                { "id": "left", "type": "column", "children": [
+                    { "id": "terminal", "type": "block", "content": { "terminal": "t1" } }
+                ] },
+                { "id": "right", "type": "column", "children": [
+                    { "id": "neighbor", "type": "block", "content": { "mod": "neighbor" } }
+                ] }
+            ]
+        }));
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            let saved = |this: &mut super::AppWindow| -> crate::layout::Node {
+                this.save();
+                serde_json::from_str(&std::fs::read_to_string(super::layout_path("test")).unwrap()).unwrap()
+            };
+            let original = this.chrome.clone();
+            this.terms["terminal"].view.update(cx, |v, _| v.ended = Some("holder_lost".into()));
+            this.terminal_ended("terminal", window, cx);
+            assert_eq!(this.chrome, original);
+            assert_eq!(saved(this), original, "saving while disconnected must retain the slot");
+            this.live.insert("t1".into(), json!({"pid": 1, "state": "live"}));
+            this.tend_terminals(false, window, cx);
+            assert!(this.terms["terminal"].view.read(cx).ended.is_none(), "recovered terminal reattaches");
+
+            let mut closed = original.clone();
+            closed.remove_slot("terminal");
+            this.terms["terminal"].view.update(cx, |v, _| v.ended = Some("exited".into()));
+            this.terminal_ended("terminal", window, cx);
+            assert_eq!(this.chrome, closed, "exit removes only the slot");
+            assert_eq!(saved(this), closed);
+
+            let error = |kind| Err(crate::hc::RpcError(json!({"data": {"kind": kind}})).into());
+            for (result, stale, removed) in [
+                (Ok(json!({"state": "finished", "reason": "holder_lost"})), false, true),
+                (error("not_found"), false, false),
+                (error("unavailable"), false, false),
+                (Ok(json!({"state": "finished", "reason": "holder_lost"})), true, false),
+                (Ok(json!({"state": "live", "reason": "holder_lost"})), false, false),
+            ] {
+                this.chrome = original.clone();
+                this.sync(window, cx);
+                let generation = this.core_generation;
+                if stale { this.core_generation += 1; }
+                this.checking_closed = true;
+                this.checked_closed(generation, vec![("terminal".into(), "t1".into(), result)], window, cx);
+                assert!(!this.checking_closed);
+                let expected = if removed { &closed } else { &original };
+                assert_eq!(&this.chrome, expected);
+                assert_eq!(&saved(this), expected);
+            }
+        }));
+    }
+
+    #[test]
     fn showing_the_tab_again_gives_its_pane_the_keyboard() {
         in_own_process("tab_shown_again");
     }
@@ -5369,6 +5757,49 @@ mod tests {
         assert!(!pane_focused(cx), "hidden, the pane can't hold the keyboard");
         select("main", cx);
         assert!(pane_focused(cx));
+    }
+
+    #[test]
+    fn close_keys_dismiss_the_top_dialog_without_closing_the_tab() {
+        in_own_process("close_keys_dismiss_dialog");
+    }
+
+    #[gpui::test]
+    fn close_keys_dismiss_dialog(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("close_keys_dismiss_dialog") {
+            return;
+        }
+        let (view, cx) = open_window(cx, "unused", "", json!({
+            "id": "root", "type": "block", "content": { "tab": "active" }
+        }));
+        cx.update(|window, cx| view.update(cx, |this, cx| {
+            this.model.add_space("sp1", "", "/tmp", crate::model::Tab::new("tb1", "", "p1", "t1"));
+            this.sync(window, cx);
+            this.open_overlay("bottom".into(), json!({"kind": "dialog"}), window, cx);
+            for kind in ["dialog", "popup"] {
+                for name in ["tab.close", "pane.close"] {
+                    let mut bindings = vec![None, Some(json!({}))];
+                    if name == "tab.close" {
+                        bindings.extend([Some(json!({"confirmed": true})), Some(json!({"id": null})), Some(json!({"id": null, "confirmed": true}))]);
+                    } else {
+                        bindings.push(Some(json!({"pane": null})));
+                    }
+                    for args in bindings {
+                        this.open_overlay("top".into(), json!({"kind": kind}), window, cx);
+                        if let Some(args) = args {
+                            this.run_key(name, args, window, cx);
+                        } else {
+                            this.run_action(name, window, cx);
+                        }
+                        assert!(!this.overlays.iter().any(|o| o.id == "top"));
+                        assert!(this.overlays.iter().any(|o| o.id == "bottom"));
+                        assert_eq!(this.model.focused_pane().as_deref(), Some("p1"));
+                        assert!(this.model.tab("tb1").is_some());
+                    }
+                }
+            }
+        }));
     }
 
     #[test]
@@ -5559,6 +5990,123 @@ export default class Probe extends View {
     }
 
     include!("window/pane_size_tests.rs");
+    include!("window/drag_tests.rs");
+
+    /// The whole path, in a real window: a layout names the toast mod, a
+    /// notification opens it with its props, and it can close itself (as one
+    /// that hands notifications to the system does). Unknown: the shipped toast.
+    #[test]
+    fn a_layout_s_toast_mod_gets_every_notification() {
+        in_own_process("toast_window");
+    }
+
+    #[gpui::test]
+    fn toast_window(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("toast_window") {
+            return;
+        }
+        let forward = r#"import { View, div } from "gpui-kit";
+import { props, closeOverlay, shared, setShared } from "herdr";
+
+export default class SystemToast extends View {
+  render() {
+    const p = props();
+    // A real one would exec("notify-send", [p.title, p.body]) here.
+    setShared("toast-test.seen", [...(shared("toast-test.seen") ?? []), `${p.title}: ${p.body}`]);
+    closeOverlay(p.overlay);
+    return div();
+  }
+}
+"#;
+        let layout = json!({ "id": "root", "type": "row", "toast": "system-toast", "children": [] });
+        let (view, cx) = open_window(cx, "system-toast", forward, layout);
+        let notify = |cx: &mut gpui::VisualTestContext| {
+            view.update_in(cx, |this, window, cx| {
+                this.sync_folders(window, cx);
+                let note = json!({ "kind": "toast", "notification": { "title": "Build finished", "body": "All green", "level": "success" } });
+                let id = crate::mods::new_overlay_id();
+                this.open_overlay(id.clone(), note, window, cx);
+                (id.clone(), this.copies[&format!("overlay:{id}")].inst.name.clone())
+            })
+        };
+        // Herdr's own notes ("Your edits are in …") may show up too.
+        let shown = |id: &str, cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            view.update(cx, |this, _| this.overlays.iter().any(|o| o.id == id))
+        };
+
+        let (id, name) = notify(cx);
+        assert_eq!(name, "system-toast");
+        assert!(!shown(&id, cx), "the layout's mod closed the notification");
+        let seen = crate::mods::shared("toast-test.seen").unwrap_or_default();
+        assert!(seen.as_array().unwrap().contains(&json!("Build finished: All green")), "the mod got the notification's props: {seen}");
+
+        view.update(cx, |this, _| this.chrome.toast = Some("no-such-mod".into()));
+        let (id, name) = notify(cx);
+        assert_eq!(name, "toast");
+        assert!(shown(&id, cx), "an unknown mod falls back to the shipped toast, which stays");
+    }
+
+    #[test]
+    fn docking_keeps_the_layouts_notification_and_menu_mods() {
+        in_own_process("dock_root_choices");
+    }
+
+    #[gpui::test]
+    fn dock_root_choices(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("dock_root_choices") {
+            return;
+        }
+        let layout = json!({
+            "id": "root", "type": "row", "toast": "chosen", "terminal_menu": "chosen", "children": []
+        });
+        let (view, cx) = open_window(cx, "chosen", "", layout);
+        let check_handlers = |cx: &mut gpui::VisualTestContext| {
+            view.update_in(cx, |this, window, cx| {
+                let id = crate::mods::new_overlay_id();
+                this.open_overlay(id.clone(), json!({
+                    "kind": "toast", "notification": { "title": "After docking", "body": "Still chosen" }
+                }), window, cx);
+                assert_eq!(this.copies[&format!("overlay:{id}")].inst.name, "chosen");
+                this.close_overlay(&id, window, cx);
+                this.open_menu("tab", json!({}), None, window, cx);
+                let id = this.overlays.last().unwrap().id.clone();
+                assert_eq!(this.copies[&format!("overlay:{id}")].inst.name, "chosen");
+                this.close_overlay(&id, window, cx);
+            });
+        };
+        check_handlers(cx);
+        let folder = crate::mods::app_dir().join("mods/new-top");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("mod.json"), r#"{"place":"top"}"#).unwrap();
+        std::fs::write(folder.join("main.js"), "").unwrap();
+        view.update_in(cx, |this, window, cx| {
+            this.sync_folders(window, cx);
+            assert_eq!(this.chrome.axis(), Some(crate::layout::Axis::Column));
+            assert!(this.chrome.walk().iter().any(|n| matches!(
+                n.content(), Some(crate::layout::Content::Mod { name, .. }) if name == "new-top"
+            )));
+            this.save();
+        });
+        check_handlers(cx);
+        view.update_in(cx, |this, window, cx| {
+            this.load_layout("test");
+            this.sync(window, cx);
+        });
+        check_handlers(cx);
+    }
+
+    #[test]
+    fn toast_is_a_root_layout_choice_that_roundtrips() {
+        let mut root = super::default_layout("main");
+        assert_eq!(root.toast, None);
+        assert!(serde_json::to_value(&root).unwrap().get("toast").is_none());
+        root.toast = Some("system-toast".into());
+        let restored: super::Node = serde_json::from_value(serde_json::to_value(&root).unwrap()).unwrap();
+        assert_eq!(restored.toast.as_deref(), Some("system-toast"));
+    }
 
     #[test]
     fn terminal_menu_preserves_clicked_target_and_uses_mod_dimensions() {
@@ -5596,15 +6144,83 @@ export default class Probe extends View {
     }
 
     #[test]
+    fn pane_swap_refuses_a_direction_that_is_not_a_string() {
+        use serde_json::json;
+        for direction in [json!(false), json!(1), json!(["left"]), json!({"to": "left"})] {
+            for args in [json!({"direction": direction}), json!({"direction": direction, "target": "p2"})] {
+                assert_eq!(super::swap_by(&args), Err("pane.swap direction must be a string (or null to omit it)".into()), "{args}");
+            }
+        }
+        assert_eq!(super::swap_by(&json!({"direction": null, "target": "p2"})), Ok(super::SwapBy::Target("p2")));
+    }
+
+    fn swap_model() -> super::Model {
+        use crate::layout::Axis;
+        let mut m = super::Model::default();
+        m.add_space("s1", "api", "/src", super::Tab::new("c1", "", "x1", "t1"));
+        m.split("x1", Axis::Row, "x2", "t2");
+        m.add_tab("s1", super::Tab::new("c2", "", "x3", "t3"));
+        m.select_tab("c1");
+        m.focus_pane("x1");
+        m
+    }
+
+    fn swap_state(m: &super::Model) -> (Vec<String>, Vec<String>, Option<String>) {
+        let order = |tab: &str| m.tab(tab).unwrap().root.panes().iter().map(|n| n.id.clone()).collect();
+        (order("c1"), order("c2"), m.focused_pane())
+    }
+
+    #[test]
+    fn an_explicit_pane_swaps_with_its_neighbor_in_the_shown_tab() {
+        let mut m = swap_model();
+        assert_eq!(super::swap_with_neighbor(&mut m, "x2", true, Some("x1".into())), Ok(()));
+        assert_eq!(swap_state(&m), (vec!["x2".into(), "x1".into()], vec!["x3".into()], Some("x1".into())));
+        assert_eq!(super::swap_with_neighbor(&mut m, "x2", true, None), Ok(()));
+        assert_eq!(swap_state(&m).0, ["x2", "x1"]);
+    }
+
+    #[test]
+    fn an_explicit_pane_swap_by_direction_refuses_panes_it_cannot_place() {
+        let mut m = swap_model();
+        let container = m.tab("c1").unwrap().root.id.clone();
+        let before = swap_state(&m);
+        let cases = [
+            ("nope".to_owned(), "no pane \"nope\"".to_owned()),
+            (container.clone(), format!("no pane {container:?}")),
+            ("x3".to_owned(), "pane.swap direction needs a pane in the shown tab, not \"x3\"".to_owned()),
+        ];
+        for (pane, error) in cases {
+            assert_eq!(super::swap_with_neighbor(&mut m, &pane, true, Some("x1".into())), Err(error), "{pane}");
+            assert_eq!(swap_state(&m), before, "{pane}");
+        }
+    }
+
+    #[test]
+    fn pane_swap_takes_exactly_one_of_direction_or_target() {
+        use super::SwapBy;
+        use serde_json::json;
+        for dir in ["left", "right", "up", "down"] {
+            assert_eq!(super::swap_by(&json!({"direction": dir})), Ok(SwapBy::Direction(dir)));
+        }
+        assert_eq!(super::swap_by(&json!({"target": "p2", "pane": "p1"})), Ok(SwapBy::Target("p2")));
+        assert_eq!(super::swap_by(&json!({"direction": "left", "target": "p2"})), Err("pane.swap takes direction or target, not both".into()));
+        for neither in [json!({}), json!(null), json!({"pane": "p1"}), json!({"direction": null, "target": null})] {
+            assert_eq!(super::swap_by(&neither), Err("pane.swap needs direction or target".into()), "{neither}");
+        }
+        assert_eq!(super::swap_by(&json!({"direction": "sideways"})), Err("pane.swap direction is left, right, up or down, not \"sideways\"".into()));
+    }
+
+    #[test]
     fn composition_commands_never_default_to_a_source_pane() {
         use serde_json::json;
         for name in ["pane.split", "pane.close", "pane.zoom", "pane.go", "pane.swap", "terminal.show"] {
             assert!(super::needs_model_pane(name, &json!({})), "{name}");
             assert!(super::needs_model_pane(name, &json!({"pane": null})), "{name}");
         }
-        for name in ["pane.split", "pane.close", "pane.zoom", "terminal.show"] {
+        for name in ["pane.split", "pane.close", "pane.zoom", "pane.swap", "terminal.show"] {
             assert!(!super::needs_model_pane(name, &json!({"pane": "explicit-pane"})), "{name}");
         }
+        assert!(super::needs_model_pane("pane.go", &json!({"pane": "explicit-pane"})));
         for name in ["terminal.open", "terminal.keep"] {
             for place in ["right", "down"] {
                 assert!(super::needs_model_pane(name, &json!({"place": place})), "{name} {place}");

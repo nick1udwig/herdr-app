@@ -58,6 +58,16 @@ test("an unnamed tab's row reads its terminal's title, not the tab number", () =
   expect(title({ name: "3", named: false }, { ...claude, title: "claude" })).toBe("3");
 });
 
+test("a title that is a folder never replaces the tab's name", () => {
+  const title = new Function("View", "localStorage", "props", "run", `${source}; return title;`)(class {}, {}, () => ({}), () => {});
+  const claude = { program: { name: "claude", key: "claude" }, title: "Herdr session names" };
+  expect(title({ name: "3", named: false }, { ...claude, title: "~/src/api" })).toBe("3");
+  expect(title({ name: "3", named: false }, { ...claude, title: "/tmp" })).toBe("3");
+  expect(title({ name: "3", named: false }, { ...claude, title: "\u2733 ~/src/api" })).toBe("3");
+  expect(title({ name: "3", named: false }, { ...claude, title: "C:\\src\\api" })).toBe("3");
+  expect(title({ name: "3", named: false }, { ...claude, title: "\u2733 Herdr session names" })).toBe("Herdr session names");
+});
+
 test("tab labels prefer the first agent, then focused terminal, then first terminal", () => {
   const leadPanes = new Function("View", `${source}; return leadPanes;`)(class {});
   const pane = (tab: string, terminal: string, agent = false, focused = false) => ({ tab, terminal, program: { agent }, focused });
@@ -94,6 +104,35 @@ function textOf(node: any): string {
   return typeof node === "string" ? node : (node?.children ?? []).map(textOf).join(" ");
 }
 
+test("a failed agent check keeps cached launchable agents and shows an error instead of missing agents", async () => {
+  const menuSource = (await readFile(new URL("../defaults/mods/new-menu/main.js", import.meta.url), "utf8"))
+    .replace(/^import .*;\n/gm, "").replace("export default class NewMenu", "class NewMenu");
+  const cached = [
+    { key: "claude", name: "Claude Code", run: ["claude"], installed: true },
+    { key: "codex", name: "Codex", run: ["codex"], installed: false },
+  ];
+  for (const agents of [[], cached]) {
+    const writes: unknown[] = [];
+    const globals = {
+      View: class {}, spaces: () => [], shared: () => ({ "": agents }), setShared: (...args: unknown[]) => writes.push(args),
+      knownAgents: async () => { throw Error("shell failed"); },
+      theme: () => ({}), props: () => ({}), keys: () => [], window: () => ({ platform: "macos" }), panes: () => [],
+      div: element, svg: element, image: element, h_flex: element, v_flex: element,
+    };
+    const NewMenu = new Function(...Object.keys(globals), `${menuSource}; return NewMenu;`)(...Object.values(globals));
+    const menu = new NewMenu();
+    let task: Promise<void>;
+    menu.init({}, { focus_handle: () => ({ focus() {} }), spawn: (run: (cx: unknown) => Promise<void>) => { task = run({ notify() {} }); } });
+    await task!;
+    const text = textOf(menu.render().node);
+    expect(text).toContain("Could not check installed agents");
+    expect(text).not.toContain("not installed");
+    expect(text).not.toContain("Codex");
+    if (agents.length) expect(text).toContain("Claude Code");
+    expect(writes).toEqual([]);
+  }
+});
+
 for (const sort of ["priority", "grouped"]) test(`${sort} render reads panes once and refreshes labels on the next render`, () => {
   const list = Array.from({ length: 64 }, (_, i) => ({
     address: `t${i}`, pane: `p${i}`, tab: `tab${i}`, space: "s1", space_name: "Project",
@@ -122,6 +161,40 @@ for (const sort of ["priority", "grouped"]) test(`${sort} render reads panes onc
   expect(orders[1]).toEqual(orders[0]);
 });
 
+for (const sort of ["priority", "grouped"]) for (const named of [false, true]) test(`${sort}: agents sharing a ${named ? "named" : "numbered"} tab keep their own titles`, () => {
+  const program = { name: "Claude", key: "claude", agent: true };
+  let list = ["Alpha task", "Beta task", "Solo task"].map((title, i) => ({
+    address: `t${i}`, pane: `p${i}`, tab: i < 2 ? "shared" : "solo", space: "s1", space_name: "Project",
+    program, title, status: "idle", seq: i,
+  }));
+  const { agents } = harness([], {
+    agents: () => list, terminals: () => list.map(a => ({ ...a, state: "live" })),
+    panes: () => list.map(a => ({ ...a, terminal: a.address })), focused: () => null,
+    spaces: () => [{ tabs: [{ id: "shared", name: named ? "Named tab" : "1", named }, { id: "solo", name: "Solo tab", named: true }] }],
+    layout: () => ({ id: "sidebar", size: { px: 268 } }), shared: () => sort,
+    theme: () => ({}), setAgentOrder() {},
+    div: element, v_flex: element, h_flex: element, svg: element, image: element,
+  });
+  const rows = () => {
+    const result = new Map<string, string>();
+    const walk = (node: any) => {
+      if (node?.id?.startsWith("ag-t")) result.set(node.id, textOf(node));
+      (node?.children ?? []).forEach(walk);
+    };
+    walk(agents.render({}).node);
+    return result;
+  };
+  const shared = rows();
+  expect(shared.get("ag-t0")).toContain("Alpha task");
+  expect(shared.get("ag-t1")).toContain("Beta task");
+  expect(shared.get("ag-t1")).not.toContain("Alpha task");
+  expect(shared.get("ag-t0")).not.toContain("Named tab");
+  expect(shared.get("ag-t2")).toContain("Solo tab");
+  expect(shared.get("ag-t2")).not.toContain("Solo task");
+  list = list.filter(a => a.address !== "t1");
+  expect(rows().get("ag-t0")).toContain(named ? "Named tab" : "Alpha task");
+});
+
 // A kept sub-agent: started by t1 (`hc run`), then given a pane (`terminal.keep`).
 function keptRender(sort: string, { width = 268, kept = [{ address: "t3", parent: "t1" }], paneless = [] as { address: string; parent: string }[], pinned = [] as string[] } = {}) {
   const program = { name: "Claude", key: "claude", agent: true };
@@ -140,16 +213,21 @@ function keptRender(sort: string, { width = 268, kept = [{ address: "t3", parent
   });
   const ids: string[] = [];
   const clicks = new Map<string, () => void>();
+  const texts = new Map<string, string>();
   const walk = (node: any) => {
-    if (node?.id) { ids.push(node.id); if (node.click) clicks.set(node.id, node.click); }
+    if (node?.id) { ids.push(node.id); texts.set(node.id, textOf(node)); if (node.click) clicks.set(node.id, node.click); }
     (node?.children ?? []).forEach(walk);
   };
   walk(agents.render({}).node);
-  return { ids, clicks, writes, order: orders[orders.length - 1] };
+  return { ids, clicks, writes, texts, order: orders[orders.length - 1] };
 }
 
 for (const sort of ["priority", "grouped"]) test(`${sort}: a kept sub-agent shows once, under its parent, and its row focuses its pane`, () => {
-  const { ids, clicks, writes, order } = keptRender(sort);
+  const { ids, clicks, writes, texts, order } = keptRender(sort);
+  expect(texts.get("ag-t1")).toContain("Project");
+  expect(texts.get("ag-t1")).not.toContain("t1");
+  expect(texts.get("sub-t3")).toContain("Claude");
+  expect(texts.get("sub-t3")).not.toContain("Project");
   expect(ids).toContain("ag-t1");
   expect(ids).toContain("sub-t3");
   expect(ids).not.toContain("ag-t3");
@@ -167,6 +245,9 @@ for (const sort of ["priority", "grouped"]) test(`${sort}: a kept sub-agent unde
 
 for (const sort of ["priority", "grouped"]) test(`${sort}: a kept sub-agent keeps its own row where no tree shows it`, () => {
   expect(keptRender(sort, { width: 44 }).ids).toContain("ag-t3"); // the rail draws no trees
-  expect(keptRender(sort, { pinned: ["t3"] }).ids).toContain("ag-t3");
+  const pinned = keptRender(sort, { pinned: ["t3"] });
+  expect(pinned.ids).toContain("ag-t3");
+  expect(pinned.texts.get("ag-t1")).toContain("t1");
+  expect(pinned.texts.get("ag-t3")).toContain("t3");
   expect(keptRender(sort, { kept: [{ address: "t3", parent: "t9" }] }).ids).toContain("ag-t3"); // its parent ended
 });
