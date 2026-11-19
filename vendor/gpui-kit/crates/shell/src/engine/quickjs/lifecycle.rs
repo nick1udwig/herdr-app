@@ -5,7 +5,7 @@ use rquickjs::Promise;
 use std::time::{Duration, Instant};
 
 struct Closing {
-    root: Entity<ShellRoot>,
+    _root: Entity<ShellRoot>,
     view: Entity<ScriptView>,
     policy: Rc<Policy>,
     application: Rc<ApplicationGeneration>,
@@ -74,7 +74,7 @@ impl ShellRuntime {
             tracing::warn!("error in View.close: {error}");
         }
         scheduler::drain_runtime_jobs(self, window, cx);
-        Some(Closing { root: root.clone(), view, policy, application, promise: promise.ok().flatten() })
+        Some(Closing { _root: root.clone(), view, policy, application, promise: promise.ok().flatten() })
     }
 
     /// Gives this copy its optional final call, once. Detach or await the task.
@@ -94,8 +94,11 @@ impl ShellRuntime {
                 if !matches!(pending, Ok(true)) { break; }
                 cx.background_executor().timer(Duration::from_millis(5)).await;
             }
-            let _ = cx.update(|cx| runtime.release_application_generation(&closing.application, cx));
-            drop(closing.root);
+            let _ = cx.update(move |cx| {
+                runtime.release_application_generation(&closing.application, cx);
+                // GPUI releases dropped entities at the end of an app update.
+                drop(closing);
+            });
         })
     }
 

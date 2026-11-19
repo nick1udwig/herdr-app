@@ -74,6 +74,8 @@ pub(crate) mod dependencies;
 pub mod dock;
 /// HERDR: shared tick for scheduled redraws.
 pub mod frame_clock;
+mod drag_paths;
+pub use drag_paths::DraggedPaths;
 pub(crate) mod engine;
 pub(crate) mod entities;
 pub(crate) mod error;

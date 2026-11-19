@@ -847,7 +847,7 @@ impl Render for ShellRoot {
         let tokens = Theme::global(cx).tokens;
         let (colors, radius, spacing) = (tokens.colors, tokens.radius, tokens.spacing);
 
-        div()
+        let root = div()
             .id("shell-root")
             // The window's base text size, from the theme rather than from
             // GPUI's default rem.
@@ -906,7 +906,8 @@ impl Render for ShellRoot {
             // HERDR: no toasts, no stack: a deferred element is laid out as a root of its own.
             .when(!self.toasts.is_empty(), |root| root.child(self.toast_layer(&colors, &radius, &spacing, cx)))
             .child(self.tooltip_overlay.clone())
-            .children(self.fps_layer(window, cx))
+            .children(self.fps_layer(window, cx));
+        TextSelection::boundary(cx.entity_id(), root)
     }
 }
 

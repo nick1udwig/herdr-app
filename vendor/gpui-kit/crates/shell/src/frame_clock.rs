@@ -50,6 +50,13 @@ pub fn wake_at(key: EntityId, deadline: Instant, cx: &mut App, wake: impl FnOnce
     schedule(key, tick.max(current as u64 + 1), epoch, now, cx, wake);
 }
 
+/// Runs a pending wake now so a screenshot can include the latest terminal output.
+pub fn flush(key: EntityId, cx: &mut App) {
+    if let Some((_, wake)) = cx.default_global::<FrameClock>().due.remove(&key) {
+        wake(cx);
+    }
+}
+
 fn schedule(key: EntityId, tick: u64, epoch: Instant, now: Instant, cx: &mut App, wake: impl FnOnce(&mut App) + 'static) {
     let clock = cx.global_mut::<FrameClock>();
     match clock.due.get(&key) {

@@ -31,6 +31,7 @@ fn peek_spinner_stops_scheduling_redraws_when_disabled(cx: &mut TestAppContext) 
         ("terminals", HostValue::Array(vec![record(&[("address", "t1"), ("status", "working")])])),
         ("agents", HostValue::Array(vec![])),
         ("panes", HostValue::Array(vec![])),
+        ("spaces", HostValue::Array(vec![])),
     ] {
         module = module.function(name, move |_| Ok(value.clone()));
     }

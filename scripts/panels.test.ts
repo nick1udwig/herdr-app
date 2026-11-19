@@ -8,7 +8,7 @@ for (const name of ["files", "changes"]) {
   const Panel = new Function("key", `return class { ${invalidate} ${render} } }`)(() => "same");
   test(`${name} coalesces hidden refreshes and refreshes when shown`, () => {
     const panel = new Panel();
-    panel.context = name === "files" ? { key: "same" } : "same";
+    panel.context = { key: "same" };
     let scans = 0, notices = 0;
     panel.refresh = () => scans++;
     const cx = { notify: () => notices++ };
@@ -30,7 +30,7 @@ for (const name of ["files", "changes"]) {
 
 test("Changes refreshes literal changed paths and preserves unrelated entries", async () => {
   const source = await readFile(new URL("../defaults/mods/changes/main.js", import.meta.url), "utf8");
-  const refresh = source.slice(source.indexOf("  refresh(cx, paths) {"), source.indexOf("  async load("));
+  const refresh = source.slice(source.indexOf("  current(context) {"), source.indexOf("  async load("));
   const calls: string[][] = [];
   const exec = async (_: string, args: string[]) => {
     calls.push(args);
@@ -41,7 +41,7 @@ test("Changes refreshes literal changed paths and preserves unrelated entries", 
   };
   const Panel = new Function("exec", "location", "key", "READ", `return class { ${refresh} }`)(exec, () => ({ cwd: "/repo" }), () => "same", []);
   const panel = new Panel();
-  panel.context = "same"; panel.files = [{ path: "unrelated", add: 4 }, { path: "gone", add: 1 }]; panel.closed = true;
+  panel.context = { key: "same" }; panel.files = [{ path: "unrelated", add: 4 }, { path: "gone", add: 1 }]; panel.closed = true;
   panel.watch = () => {}; panel.setLines = () => {};
   let task: Promise<void>;
   const cx = { notify() {}, spawn(fn: Function) { task = fn(cx); } };
